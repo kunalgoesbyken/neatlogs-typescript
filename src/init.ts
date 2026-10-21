@@ -10,6 +10,7 @@
 
 import * as path from "node:path";
 import { createHash } from "node:crypto";
+import { configureReplayFromEnvironment } from './replay/environment.js';
 
 import { Resource } from "@opentelemetry/resources";
 import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
@@ -70,6 +71,8 @@ import {
   type UploadAuthorityOption,
 } from "./core/upload-authority.js";
 import type { InitOptions } from "./types.js";
+import { AbTestClient } from './ab-test/client.js';
+import { getAbTestClient, setAbTestClient } from './ab-test/shared.js';
 
 const logger = getLogger();
 
@@ -160,6 +163,7 @@ function _resolveWorkflowName(workflowName?: string): string {
 
 const INIT_OPTION_KEYS = new Set<keyof InitOptions>([
   "apiKey",
+  "experiments",
   "workflowName",
   "userId",
   "tags",
@@ -336,6 +340,7 @@ function initIdentity(options: InitOptions): InitIdentity {
   const apiKeyDigest = createHash("sha256").update(apiKey).digest("hex");
   const serialized = stableValue({
     apiKeyDigest,
+    experiments: options.experiments ?? null,
     workflowName: _resolveWorkflowName(options.workflowName),
     userId: options.userId ?? null,
     tags: options.tags ?? [],
@@ -416,6 +421,7 @@ export function init(options: InitOptions = {}): Promise<void> {
   let identity: InitIdentity;
   try {
     validateInitOptions(options);
+    configureReplayFromEnvironment();
     identity = initIdentity(options);
   } catch (error) {
     return Promise.reject(error);
@@ -449,6 +455,7 @@ export function init(options: InitOptions = {}): Promise<void> {
       if (_initPromise === current) _initPromise = null;
       if (_lifecycleState === "initializing") {
         closeSharedClient();
+        setAbTestClient(undefined);
         _lifecycleState = "uninitialized";
         _initIdentity = null;
       }
@@ -533,6 +540,15 @@ async function _performInit(options: InitOptions): Promise<void> {
   // 8b. Initialize shared PromptClient so module-level helpers work after init()
   if (resolvedKey && resolvedKey !== "disabled") {
     setSharedClient(new PromptClient({ baseUrl, apiKey: resolvedKey }));
+  }
+  if (options.experiments && !disableExportResolved) {
+    const experiments = new AbTestClient({
+      baseUrl: options.experiments.baseUrl ?? baseUrl,
+      apiKey: resolvedKey,
+      keys: options.experiments.keys,
+    });
+    setAbTestClient(experiments);
+    await experiments.start();
   }
 
   // 9. Build OTel Resource
@@ -821,6 +837,8 @@ export async function flush(): Promise<boolean> {
     }
   }
 
+  const experiments = getAbTestClient();
+  if (experiments && !(await experiments.flush())) success = false;
   return success;
 }
 
@@ -1046,6 +1064,14 @@ async function _performShutdown(
         spanProcessor.shutdown(),
       );
     }
+  }
+
+  const experiments = getAbTestClient();
+  if (experiments) {
+    await attempt('A/B exposures', async () => {
+      if (!(await experiments.flush())) success = false;
+    });
+    setAbTestClient(undefined);
   }
 
   // Reset all module-level state

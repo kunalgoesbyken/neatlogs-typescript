@@ -68,6 +68,22 @@ export function serializeCaptureBody(body: unknown): string {
   return serialized;
 }
 
+async function boundedResponse(response: Response): Promise<unknown> {
+  const reader = response.body?.getReader();
+  if (!reader) throw new DatasetCaptureError('Empty dataset API response.');
+  const chunks: Uint8Array[] = []; let bytes = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytes += value.length;
+      if (bytes > 17 * 1024 * 1024) throw new DatasetCaptureError('Dataset API response exceeds 17 MiB.');
+      chunks.push(value);
+    }
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } finally { await reader.cancel(); }
+}
+
 export class DatasetApi {
   private readonly baseUrl: string;
   private readonly token: string;
@@ -131,7 +147,7 @@ export class DatasetApi {
           await response.body?.cancel();
           throw new DatasetCaptureError(`Dataset ${method} failed with HTTP ${response.status}.`, response.status);
         }
-        const envelope = record(await response.json());
+        const envelope = record(await boundedResponse(response));
         if (envelope.success !== true || !('data' in envelope)) throw new DatasetCaptureError('Invalid dataset API envelope.');
         return {
           data: envelope.data,

@@ -28,6 +28,7 @@ import {
   maybeOpenAutoRoot,
 } from "../core/auto-root.js";
 import type { SpanOptions, MaskFunction } from "../types.js";
+import { lookupReplay } from "../replay/session.js";
 import {
   DEFAULT_MAX_SEMANTIC_STREAM_EVENTS,
   DEFAULT_MAX_STREAM_CAPTURE_BYTES,
@@ -657,7 +658,15 @@ export function decorateSpan<TArgs extends any[], TReturn>(
         }
 
         // Execute the function
-        const result = fn(...args);
+        const replay = opts.replay && (opts.kind === 'TOOL' || opts.kind === 'MCP_TOOL')
+          ? lookupReplay('tool', opts.toolName ?? spanName, args.length === 1 ? args[0] : args)
+          : null;
+        const returnsPromise = opts.replay && typeof opts.replay === 'object'
+          ? opts.replay.result === 'promise'
+          : fn.constructor.name === 'AsyncFunction';
+        const result = replay?.outcome === 'HIT'
+          ? returnsPromise ? Promise.resolve(replay.entry.output) : replay.entry.output
+          : fn(...args);
 
         const handleResult = (resolved: any): any => {
           // A promise may resolve to a stream. Classify the resolved value before

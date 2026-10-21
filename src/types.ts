@@ -62,6 +62,8 @@ export interface PromptMessage {
 export interface InitOptions {
   /** Neatlogs API key. Falls back to NEATLOGS_API_KEY env var. */
   apiKey?: string;
+  /** Fetch these A/B test settings at init and refresh in the background every 60 seconds. */
+  experiments?: { keys: string[]; baseUrl?: string };
   /** Name of the workflow being traced. Defaults to process.argv[1]. */
   workflowName?: string;
   /**
@@ -169,6 +171,8 @@ export interface SpanOptions {
   // Tool-specific
   /** Tool name (for kind: TOOL or MCP_TOOL). */
   toolName?: string;
+  /** Serve saved JSON tool results inside a local ReplaySession. Promise factories must declare result: 'promise'. */
+  replay?: true | { result: 'value' | 'promise' };
   /** Tool parameters schema (for kind: TOOL). */
   parameters?: Record<string, any>;
   /** JSON schema describing the tool interface (for kind: MCP_TOOL). */

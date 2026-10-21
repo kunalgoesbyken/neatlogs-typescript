@@ -62,6 +62,8 @@ export async function applyMask(
 ): Promise<Record<string, any> | null> {
   const maskFn = effectiveMask(spanData, globalMask);
   if (!maskFn) return spanData;
+  // Existing callbacks may mask only normalized I/O; never retain a second raw copy.
+  if (spanData.attributes) delete spanData.attributes['neatlogs.replay.model_capture'];
 
   const signalType = options.signalType ?? 'span';
   const timeoutMs = options.timeoutMs ?? DEFAULT_MASK_TIMEOUT_MS;

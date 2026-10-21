@@ -36,6 +36,8 @@ import {
   recordReportedFailure,
 } from './core/span-outcome.js';
 import { captureMedia, captureMediaWithIndex } from './core/media.js';
+import { cachedModelSpan, providerReplay, restoreGoogleResponse } from './replay/provider.js';
+import { prepareProviderCapture } from './replay/provider-capture.js';
 import {
   getNeatlogsTracer,
   getNeatlogsParentContext,
@@ -200,7 +202,11 @@ function tracedChatSend(
     (typeof capturedMessage === 'string' ? capturedMessage : safeStringify(capturedMessage)),
   );
 
-  const result = withNeatlogsSpan(span, () => original(params, ...rest));
+  const result = withNeatlogsSpan(span, () => {
+    // The SDK owns mutable chat history. A saved JSON reply cannot update it.
+    providerReplay('google_genai.models.generate_content', params, false);
+    return original(params, ...rest);
+  });
 
   return Promise.resolve(result).then(
     (response: any) => {
@@ -299,14 +305,27 @@ function tracedGenerateContent(original: (...args: any[]) => any, isStream: bool
 
     setInputAttributes(span, opts);
 
-    const result = withNeatlogsSpan(span, () => original(opts, ...rest));
+    const captureResponse = prepareProviderCapture(span, 'google_genai.models.generate_content', opts, !isStream && rest.length === 0);
+    let replayed = false;
+    let result: unknown;
+    try {
+      result = withNeatlogsSpan(span, () => {
+        const saved = providerReplay('google_genai.models.generate_content', opts, !isStream && rest.length === 0);
+        replayed = saved !== undefined;
+        return replayed ? restoreGoogleResponse(saved) : original(opts, ...rest);
+      });
+    } catch (error) {
+      recordError(span, error);
+      throw error;
+    }
 
     return Promise.resolve(result).then(
       (response: any) => {
         if (isStream) {
           return wrapStream(response, span);
         }
-        finalizeResponse(span, response);
+        if (!replayed) captureResponse(response);
+        finalizeResponse(replayed ? cachedModelSpan(span) : span, response);
         return response;
       },
       (err: any) => {

@@ -636,6 +636,18 @@ describe('openaiAgentsProcessor', () => {
     expect(attr(llm[0], 'neatlogs.llm.input_messages.2.content')).toBe('tail');
   });
 
+  it('keeps text part boundaries distinct when delimiter text matches', () => {
+    const llm = runResponses('trace-part-boundaries', [
+      [{ role: 'user', content: [{ type: 'input_text', text: 'a: input_text:b' }] }],
+      [{ role: 'user', content: [
+        { type: 'input_text', text: 'a' },
+        { type: 'input_text', text: 'b' },
+      ] }],
+    ]);
+    expect(attr(llm[0], 'neatlogs.llm.input_messages.0.content')).toBe('a: input_text:b');
+    expect(attr(llm[1], 'neatlogs.llm.input_messages.0.content')).toBe('ab');
+  });
+
   it('captures same-length but different input histories on later response spans', () => {
     // Regression: a trace-wide message count treated a same-length list as an
     // already captured prefix, so a distinct one-message _input lost its input.

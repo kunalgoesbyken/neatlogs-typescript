@@ -395,20 +395,20 @@ function cyrb53(str: string, seed = 0): string {
 function messageFingerprint(message: any): string {
   const role = typeof message === 'object' && message ? String(message.role ?? '') : '';
   const content = typeof message === 'object' && message ? message.content : message;
-  const text = Array.isArray(content)
-    ? content.map(partIdentity).join(' ')
+  const identity = Array.isArray(content)
+    ? content.map(partIdentity)
     : (typeof content === 'string' ? content : partIdentity(content));
-  return cyrb53(`${role} ${text}`);
+  return cyrb53(safeStringify([role, identity]));
 }
 
-function partIdentity(part: any): string {
-  if (typeof part === 'string') return part;
-  if (!part || typeof part !== 'object') return '';
+function partIdentity(part: any): unknown {
+  if (typeof part === 'string') return ['text', part];
+  if (!part || typeof part !== 'object') return ['empty'];
   const { text, ...rest } = part;
   const media = Object.keys(rest).length > 1 || (Object.keys(rest).length === 1 && !('type' in rest))
     ? cyrb53(safeStringify(rest))
     : '';
-  return `${part.type ?? ''}:${typeof text === 'string' ? text : ''}:${media}`;
+  return [part.type ?? '', typeof text === 'string' ? text : '', media];
 }
 
 // Text only: media parts are captured by captureMedia, never stringified here.

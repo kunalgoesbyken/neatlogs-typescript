@@ -94,6 +94,11 @@ export function traceTool<TArgs = any, TResult = any>(
         span.setStatus({ code: SpanStatusCode.OK });
         return result;
       } catch (err) {
+        const message = err instanceof Error ? err.message : typeof err === 'string' ? err : 'Tool execution failed';
+        span.setAttribute(
+          'output.value',
+          safeStringify(captureMedia(span, 'neatlogs.tool.output', { kind: 'tool_error', message }, 'output')),
+        );
         recordError(span, err);
         throw err;
       } finally {

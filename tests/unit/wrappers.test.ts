@@ -20,6 +20,7 @@ import { strandsHooks } from '../../src/strands.js';
 import { openaiAgentsProcessor } from '../../src/openai-agents.js';
 import { wrapMastra } from '../../src/mastra-wrap.js';
 import { _setNeatlogsProvider } from '../../src/core/provider.js';
+import { discardPendingMedia } from '../../src/core/media.js';
 
 let provider: NodeTracerProvider;
 let exporter: InMemorySpanExporter;
@@ -468,7 +469,10 @@ describe('openaiAgentsProcessor', () => {
     processor.onTraceStart({ traceId: 'trace-x', name: 'Agent workflow' });
     processor.onSpanStart({ spanId: 'a1', traceId: 'trace-x', spanData: { type: 'agent', name: 'Weather Assistant', tools: ['get_weather'] } });
     processor.onSpanStart({ spanId: 'r1', traceId: 'trace-x', spanData: { type: 'response' } });
-    processor.onSpanEnd({ spanId: 'r1', traceId: 'trace-x', spanData: { type: 'response', _response: {
+    processor.onSpanEnd({ spanId: 'r1', traceId: 'trace-x', spanData: { type: 'response', _input: [
+      { role: 'system', content: 'Be concise' },
+      { role: 'user', content: 'Where is order 42?' },
+    ], _response: {
       model: 'gpt-4o-mini-2024-07-18',
       usage: { input_tokens: 57, output_tokens: 15, total_tokens: 72 },
       output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Sunny' }] }],
@@ -487,6 +491,13 @@ describe('openaiAgentsProcessor', () => {
     expect(attr(llm, 'neatlogs.llm.token_count.total')).toBe(72);
     expect(attr(llm, 'neatlogs.llm.output_messages.0.content')).toBe('Sunny');
 
+    const workflow = spans.find(s => s.attributes['neatlogs.span.kind'] === 'WORKFLOW')!;
+    expect(attr(workflow, 'input.value')).toBe('Where is order 42?');
+    expect(attr(workflow, 'output.value')).toBe('Sunny');
+    expect(attr(llm, 'neatlogs.llm.input_messages.0.role')).toBe('system');
+    expect(attr(llm, 'neatlogs.llm.input_messages.1.role')).toBe('user');
+    expect(attr(llm, 'neatlogs.llm.input_messages.1.content')).toBe('Where is order 42?');
+
     const tool = spans.find(s => s.attributes['neatlogs.span.kind'] === 'TOOL')!;
     expect(attr(tool, 'neatlogs.tool.name')).toBe('get_weather');
 
@@ -502,6 +513,221 @@ describe('openaiAgentsProcessor', () => {
     const spans = getSpans();
     expect(spans.length).toBe(1);
     expect(spans[0].status.code).toBe(2); // ERROR
+  });
+  it('keeps data URLs in text parts out of root input and output', () => {
+    const processor = openaiAgentsProcessor();
+    const data = Buffer.alloc(120_000, 0x42).toString('base64');
+    const url = `data:image/png;base64,${data}`;
+    processor.onTraceStart({ traceId: 'trace-t', name: 'Agent workflow' });
+    processor.onSpanStart({ spanId: 'r2', traceId: 'trace-t', spanData: { type: 'response' } });
+    processor.onSpanEnd({ spanId: 'r2', traceId: 'trace-t', spanData: { type: 'response', _input: [
+      { role: 'user', content: [{ type: 'input_text', text: url }] },
+    ], _response: {
+      model: 'gpt-4o-mini',
+      output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: url }] }],
+    } } });
+    processor.onTraceEnd({ traceId: 'trace-t' });
+
+    const spans = exporter.getFinishedSpans();
+    expect(JSON.stringify(spans.map(s => s.attributes))).not.toContain(data.slice(0, 256));
+    for (const span of spans) discardPendingMedia(span as object);
+  });
+
+  it('captures only new input turns per response span', () => {
+    const processor = openaiAgentsProcessor();
+    processor.onTraceStart({ traceId: 'trace-long', name: 'Agent workflow' });
+    const history: any[] = [];
+    for (let turn = 0; turn < 40; turn++) {
+      history.push({ role: 'user', content: `question ${turn} ` + 'q'.repeat(2000) });
+      const id = `r${turn}`;
+      processor.onSpanStart({ spanId: id, traceId: 'trace-long', spanData: { type: 'response' } });
+      processor.onSpanEnd({ spanId: id, traceId: 'trace-long', spanData: { type: 'response', _input: history.slice(), _response: {
+        model: 'gpt-4o-mini',
+        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: `answer ${turn}` }] }],
+        usage: { input_tokens: 10, output_tokens: 2 },
+      } } });
+      history.push({ role: 'assistant', content: `answer ${turn}` });
+    }
+    processor.onTraceEnd({ traceId: 'trace-long' });
+
+    const llm = exporter.getFinishedSpans().filter(s => s.attributes['neatlogs.span.kind'] === 'LLM');
+    expect(llm.length).toBe(40);
+    for (const span of llm) {
+      const chars = Object.entries(span.attributes)
+        .filter(([k]) => /^neatlogs\.llm\.input_messages\.\d+\.content$/.test(k))
+        .reduce((n, [, v]) => n + String(v).length, 0);
+      expect(chars).toBeLessThan(2 * 2100 + 100);
+      // Usage and output are still written however long the history is.
+      expect(attr(span, 'neatlogs.llm.token_count.prompt')).toBe(10);
+      expect(attr(span, 'neatlogs.llm.output_messages.0.content')).toMatch(/^answer /);
+    }
+    // The last span holds only the two turns added since the previous span, not the 77 earlier ones.
+    const last = llm[llm.length - 1];
+    const inputKeys = Object.keys(last.attributes).filter(k => /^neatlogs\.llm\.input_messages\.\d+\.content$/.test(k));
+    expect(inputKeys).toEqual(['neatlogs.llm.input_messages.77.content', 'neatlogs.llm.input_messages.78.content']);
+    // Total captured across the trace is about one copy of the history, not one per span.
+    const total = llm.reduce((n, s) => n + Object.entries(s.attributes)
+      .filter(([k]) => /^neatlogs\.llm\.input_messages\.\d+\.content$/.test(k))
+      .reduce((m, [, v]) => m + String(v).length, 0), 0);
+    expect(total).toBeLessThan(40 * 2100 + 40 * 20);
+  });
+
+  function runResponses(traceId: string, inputs: any[][]) {
+    const processor = openaiAgentsProcessor();
+    processor.onTraceStart({ traceId, name: 'Agent workflow' });
+    inputs.forEach((input, n) => {
+      const spanId = `${traceId}-r${n}`;
+      processor.onSpanStart({ spanId, traceId, spanData: { type: 'response' } });
+      processor.onSpanEnd({ spanId, traceId, spanData: { type: 'response', _input: input, _response: {
+        model: 'gpt-4o-mini',
+        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: `answer ${n}` }] }],
+      } } });
+    });
+    processor.onTraceEnd({ traceId });
+    return exporter.getFinishedSpans().filter(s => s.attributes['neatlogs.span.kind'] === 'LLM');
+  }
+
+  it('captures a same-text message whose media differs from an earlier response', () => {
+    const image = (url: string) => [{ role: 'user', content: [
+      { type: 'input_text', text: 'What is in this image?' },
+      { type: 'input_image', image_url: url },
+    ] }];
+    const llm = runResponses('trace-media-id', [
+      image('https://example.com/a.png'),
+      image('https://example.com/b.png'),
+    ]);
+    expect(llm.length).toBe(2);
+    expect(attr(llm[0], 'neatlogs.llm.input_messages.0.media.0.reference')).toBe('https://example.com/a.png');
+    expect(attr(llm[1], 'neatlogs.llm.input_messages.0.media.0.reference')).toBe('https://example.com/b.png');
+  });
+
+  it('still skips a repeated message with identical text and media', () => {
+    const first = [{ role: 'user', content: [
+      { type: 'input_text', text: 'look' },
+      { type: 'input_image', image_url: 'https://example.com/a.png' },
+    ] }];
+    const llm = runResponses('trace-media-same', [first, [...first, { role: 'user', content: 'and now?' }]]);
+    expect(attr(llm[1], 'neatlogs.llm.input_messages.0.content')).toBeUndefined();
+    expect(attr(llm[1], 'neatlogs.llm.input_messages.1.content')).toBe('and now?');
+  });
+
+  it('keeps a long first message whole and the short message after it', () => {
+    const long = 'x'.repeat(21000);
+    const history = [{ role: 'user', content: long }, { role: 'user', content: 'short follow up' }];
+    const llm = runResponses('trace-long-first', [history, history]);
+    expect(attr(llm[0], 'neatlogs.llm.input_messages.0.content')).toBe(long);
+    expect(attr(llm[0], 'neatlogs.llm.input_messages.1.content')).toBe('short follow up');
+    expect(attr(llm[1], 'neatlogs.llm.input_messages.0.content')).toBeUndefined();
+    expect(attr(llm[1], 'neatlogs.llm.input_messages.1.content')).toBeUndefined();
+  });
+
+  it('writes every message of a very long input on the only response span', () => {
+    // No later response span exists to pick up anything left out.
+    const big = (label: string) => `${label} ` + 'y'.repeat(300 * 1024);
+    const history = [
+      { role: 'user', content: big('one') },
+      { role: 'user', content: big('two') },
+      { role: 'user', content: 'tail' },
+    ];
+    const llm = runResponses('trace-terminal', [history]);
+    expect(llm.length).toBe(1);
+    expect(attr(llm[0], 'neatlogs.llm.input_messages.0.content')).toBe(history[0].content);
+    expect(attr(llm[0], 'neatlogs.llm.input_messages.1.content')).toBe(history[1].content);
+    expect(attr(llm[0], 'neatlogs.llm.input_messages.2.content')).toBe('tail');
+  });
+
+  it('keeps text part boundaries distinct when delimiter text matches', () => {
+    const llm = runResponses('trace-part-boundaries', [
+      [{ role: 'user', content: [{ type: 'input_text', text: 'a: input_text:b' }] }],
+      [{ role: 'user', content: [
+        { type: 'input_text', text: 'a' },
+        { type: 'input_text', text: 'b' },
+      ] }],
+    ]);
+    expect(attr(llm[0], 'neatlogs.llm.input_messages.0.content')).toBe('a: input_text:b');
+    expect(attr(llm[1], 'neatlogs.llm.input_messages.0.content')).toBe('ab');
+  });
+
+  it('captures same-length but different input histories on later response spans', () => {
+    // Regression: a trace-wide message count treated a same-length list as an
+    // already captured prefix, so a distinct one-message _input lost its input.
+    const processor = openaiAgentsProcessor();
+    processor.onTraceStart({ traceId: 'trace-sl', name: 'Agent workflow' });
+    processor.onSpanStart({ spanId: 'r1', traceId: 'trace-sl', spanData: { type: 'response' } });
+    processor.onSpanEnd({ spanId: 'r1', traceId: 'trace-sl', spanData: { type: 'response', _input: [
+      { role: 'user', content: 'first prompt' },
+    ], _response: {
+      model: 'gpt-4o-mini',
+      output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'first answer' }] }],
+    } } });
+    processor.onSpanStart({ spanId: 'r2', traceId: 'trace-sl', spanData: { type: 'response' } });
+    processor.onSpanEnd({ spanId: 'r2', traceId: 'trace-sl', spanData: { type: 'response', _input: [
+      { role: 'user', content: 'a different prompt' },
+    ], _response: {
+      model: 'gpt-4o-mini',
+      output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'second answer' }] }],
+    } } });
+    processor.onTraceEnd({ traceId: 'trace-sl' });
+
+    const llm = exporter.getFinishedSpans().filter(s => s.attributes['neatlogs.span.kind'] === 'LLM');
+    expect(llm.length).toBe(2);
+    expect(attr(llm[0], 'neatlogs.llm.input_messages.0.content')).toBe('first prompt');
+    expect(attr(llm[1], 'neatlogs.llm.input_messages.0.content')).toBe('a different prompt');
+  });
+
+  it('captures input on interleaved parallel branches sharing one trace', () => {
+    // Regression: two branches interleave response spans with diverging
+    // histories; only a verified shared prefix may be skipped, so neither
+    // branch loses its turns.
+    const processor = openaiAgentsProcessor();
+    const respond = (id: string, input: any[], answer: string) => {
+      processor.onSpanStart({ spanId: id, traceId: 'trace-cb', spanData: { type: 'response' } });
+      processor.onSpanEnd({ spanId: id, traceId: 'trace-cb', spanData: { type: 'response', _input: input, _response: {
+        model: 'gpt-4o-mini',
+        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: answer }] }],
+      } } });
+    };
+    const shared = { role: 'user', content: 'shared start' };
+    processor.onTraceStart({ traceId: 'trace-cb', name: 'Agent workflow' });
+    respond('a1', [shared, { role: 'user', content: 'branch a turn 1' }], 'a1');
+    respond('b1', [shared, { role: 'user', content: 'branch b turn 1' }], 'b1');
+    respond('a2', [shared, { role: 'user', content: 'branch a turn 1' }, { role: 'assistant', content: 'a1' }, { role: 'user', content: 'branch a turn 2' }], 'a2');
+    processor.onTraceEnd({ traceId: 'trace-cb' });
+
+    const llm = exporter.getFinishedSpans().filter(s => s.attributes['neatlogs.span.kind'] === 'LLM');
+    expect(llm.length).toBe(3);
+    expect(attr(llm[0], 'neatlogs.llm.input_messages.0.content')).toBe('shared start');
+    expect(attr(llm[0], 'neatlogs.llm.input_messages.1.content')).toBe('branch a turn 1');
+    // The b branch keeps its own turn even though its list matched a's length.
+    expect(attr(llm[1], 'neatlogs.llm.input_messages.1.content')).toBe('branch b turn 1');
+    // The continued a branch still lands its newest turn.
+    expect(attr(llm[2], 'neatlogs.llm.input_messages.3.content')).toBe('branch a turn 2');
+  });
+
+  it('keeps inline media out of response and root text attributes', () => {
+    const processor = openaiAgentsProcessor();
+    const data = Buffer.alloc(120_000, 0x41).toString('base64');
+    processor.onTraceStart({ traceId: 'trace-m', name: 'Agent workflow' });
+    processor.onSpanStart({ spanId: 'r1', traceId: 'trace-m', spanData: { type: 'response' } });
+    processor.onSpanEnd({ spanId: 'r1', traceId: 'trace-m', spanData: { type: 'response', _input: [
+      { role: 'user', content: [
+        { type: 'input_text', text: 'What is in this image?' },
+        { type: 'input_image', image_url: `data:image/png;base64,${data}` },
+      ] },
+    ], _response: {
+      model: 'gpt-4o-mini',
+      output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'A cat' }] }],
+    } } });
+    processor.onTraceEnd({ traceId: 'trace-m' });
+
+    const spans = exporter.getFinishedSpans();
+    expect(JSON.stringify(spans.map(s => s.attributes))).not.toContain(data.slice(0, 256));
+    const llm = spans.find(s => s.attributes['neatlogs.span.kind'] === 'LLM')!;
+    const workflow = spans.find(s => s.attributes['neatlogs.span.kind'] === 'WORKFLOW')!;
+    expect(attr(llm, 'neatlogs.llm.input_messages.0.content')).toBe('What is in this image?');
+    expect(attr(llm, 'neatlogs.llm.input_messages.0.media.0.mime_type')).toBe('image/png');
+    expect(attr(workflow, 'input.value')).toBe('What is in this image?');
+    for (const span of spans) discardPendingMedia(span as object);
   });
 });
 

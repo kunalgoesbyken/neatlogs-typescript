@@ -32,8 +32,7 @@ async function workspace() {
 async function agent(path: string, allowLive = false): Promise<string[]> {
   const file = join(path, 'agent.mts');
   await writeFile(file, `
-import { init, shutdown } from ${JSON.stringify(resolve('src/init.ts'))};
-import { span } from ${JSON.stringify(resolve('src/decorators/index.ts'))};
+import { init, shutdown, span } from ${JSON.stringify(resolve('dist/index.mjs'))};
 await init({ disableExport: true });
 let text = ''; for await (const chunk of process.stdin) text += chunk;
 const input = JSON.parse(text);

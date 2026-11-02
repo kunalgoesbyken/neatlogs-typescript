@@ -73,8 +73,7 @@ describe('entire saved dataset replay', () => {
   it('runs real child processes in bounded batches and resumes upload without repeating a completed command', async () => {
     const directory = await workspace(), configFile = join(directory, 'agent.yaml'), agentFile = join(directory, 'agent.mts'), stateFile = join(directory, 'state.json'), logFile = join(directory, 'calls.log');
     await writeFile(agentFile, `import { appendFile } from 'node:fs/promises';
-import { init, shutdown } from ${JSON.stringify(resolve('src/init.ts'))};
-import { span } from ${JSON.stringify(resolve('src/decorators/index.ts'))};
+import { init, shutdown, span } from ${JSON.stringify(resolve('dist/index.mjs'))};
 await init({ disableExport: true });
 let raw='';for await(const chunk of process.stdin)raw+=chunk; const input=JSON.parse(raw);
 const lookup=span({kind:'TOOL',name:'lookup',replay:true},async()=>{throw new Error('Live tool forbidden');});

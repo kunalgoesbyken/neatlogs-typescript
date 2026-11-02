@@ -33,9 +33,6 @@ export {
   getDeliveryDiagnostics,
 } from "./init.js";
 export { Client, type ClientOptions } from "./core/client.js";
-export { AbTestClient, type AbTestClientOptions, type AbAssignment, type AbAssignmentOptions, type LogExposureOptions } from './ab-test/client.js';
-export { abTest, logExposure, completeAbTestUnit } from './ab-test/shared.js';
-export type { AbParams } from './ab-test/protocol.js';
 export { ReplaySession, getReplayStatus, replayModel } from './replay/session.js';
 export { parseReplayRecording } from './replay/contracts.js';
 export { replayRecordingFromCase } from './replay/frozen-case.js';

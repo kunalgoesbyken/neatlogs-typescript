@@ -14,8 +14,9 @@ let failUpload = false;
 let verdict = 'pass';
 let uploads: Record<string, unknown>[];
 let paths: string[];
+let manyCases: string[];
 beforeEach(async () => {
-  uploads = []; paths = []; failUpload = false; verdict = 'pass'; directory = mkdtempSync(join(tmpdir(), 'neatlogs-eval-'));
+  uploads = []; paths = []; manyCases = []; failUpload = false; verdict = 'pass'; directory = mkdtempSync(join(tmpdir(), 'neatlogs-eval-'));
   server = createServer(async (request, response) => {
     const path = request.url ?? ''; paths.push(path);
     const chunks = []; for await (const chunk of request) chunks.push(Buffer.from(chunk));
@@ -23,9 +24,9 @@ beforeEach(async () => {
     let data: unknown, status = 200;
     if (request.method === 'GET') {
       if (path.includes('/comparison')) data = { state: 'ready', coverage: { complete: true } };
-      else if (path.includes(`/cases/${caseId}`)) data = { case: { caseId, revisionId, input: 'hello', expected: { value: 'hello' }, metadata: { language: 'en' } } };
-      else if (path.includes('/cases?')) data = { cases: [{ caseId }], total: 1 };
-      else data = { dataset: { caseCount: 1 }, version: { id: versionId } };
+      else if (path.includes('/cases/') && (path.includes(`/cases/${caseId}`) || manyCases.some(id => path.includes(`/cases/${id}`)))) data = { case: { caseId: path.split('/cases/')[1]!.split('?')[0], revisionId, input: 'hello', expected: { value: 'hello' }, metadata: { language: 'en' } } };
+      else if (path.includes('/cases?')) { const offset = Number(new URL(path, 'http://localhost').searchParams.get('offset')); data = manyCases.length ? { cases: manyCases.slice(offset, offset + 100).map(caseId => ({ caseId })), total: manyCases.length } : { cases: [{ caseId }], total: 1 }; }
+      else data = { dataset: { caseCount: manyCases.length || 1 }, version: { id: versionId } };
     } else {
       expect(request.headers.authorization).toBe('Bearer task-token'); expect(request.headers['x-project-id']).toBe(projectId); expect(request.headers['idempotency-key']).toBeTruthy();
       if (path.endsWith('/outputs')) { if (failUpload) status = 503; else uploads.push(body); data = { outputId: randomUUID(), state: 'succeeded' }; }
@@ -57,6 +58,21 @@ describe('task evaluation over the public HTTP contract', () => {
   it('retains task errors and returns incomplete', async () => {
     const result = await runEval({ dataset: datasetId!, label: 'error', api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => { throw new Error('task failed'); } });
     expect(result.exitCode).toBe(4); expect(result.errors).toBe(1); expect(uploads[0]?.error).toEqual({ code: 'Error', message: 'task failed' });
+  });
+  it('does not report trace evidence when the SDK is not initialized', async () => {
+    const task = () => { throw new Error('must not run'); };
+    await expect(runEval({ dataset: datasetId!, label: 'trace', traceEvidence: true, api: { projectId: projectId!, token: 'task-token', baseUrl }, task })).rejects.toThrow(/Initialize the Neatlogs SDK/);
+    expect(uploads).toEqual([]);
+  });
+  it('rejects cases outside the selected dataset before starting a run', async () => {
+    await expect(runEval({ dataset: datasetId!, caseIds: [randomUUID()], label: 'selection', api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' })).rejects.toThrow(/belong to the pinned dataset/);
+    expect(paths.some(path => path.endsWith('/runs'))).toBe(false);
+  });
+  it('runs a selected case from a later dataset page', async () => {
+    manyCases = Array.from({ length: 101 }, () => randomUUID());
+    const result = await runEval({ dataset: datasetId!, caseIds: [manyCases[100]!], label: 'selection', api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' });
+    expect(result.exitCode).toBe(0); expect(uploads).toHaveLength(1);
+    expect(paths.some(path => path.includes('offset=100'))).toBe(true);
   });
   it('rejects changed task code on resume', async () => {
     const options = { dataset: datasetId!, label: 'resume', statePath: join(directory, 'run.json'), api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'original' };

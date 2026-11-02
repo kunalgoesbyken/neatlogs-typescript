@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { DatasetApi, json, type DatasetApiOptions, type DatasetJson } from './dataset/api.js';
 import { LocalRunApi } from './replay/run-api.js';
 import { trace } from './core/context.js';
+import { getNeatlogsProvider } from './core/provider.js';
 
 export class Dataset {
   constructor(readonly name: string, readonly options: { versionId?: string; tag?: string } = {}) {}
@@ -32,10 +33,12 @@ export interface RunEvalOptions {
   maxErrorRate?: number;
   statePath?: string;
   resume?: boolean;
+  traceEvidence?: boolean;
+  caseIds?: string[];
 }
 export interface EvalResult { runId: string; comparison: Record<string, unknown>; gate: Awaited<ReturnType<LocalRunApi['gate']>> | null; errors: number; exitCode: 0 | 1 | 4 }
-const slotSchema = z.object({ key: z.string().uuid(), executing: z.boolean(), accepted: z.boolean().optional(), body: z.object({ caseId: z.string().uuid(), trial: z.number().int(), output: z.json().optional(), metrics: z.record(z.string(), z.number()).optional(), error: z.object({ code: z.string(), message: z.string() }).optional() }).strict().optional() }).strict();
-const stateSchema = z.object({ projectId: z.string().uuid(), request: z.record(z.string(), z.json()), taskDigest: z.string().regex(/^[a-f0-9]{64}$/), registrationKey: z.string().uuid(), runId: z.string().uuid().nullable(), slots: z.record(z.string(), slotSchema) }).strict();
+const slotSchema = z.object({ key: z.string().uuid(), executing: z.boolean(), accepted: z.boolean().optional(), body: z.object({ caseId: z.string().uuid(), trial: z.number().int(), traceId: z.string().regex(/^[a-f0-9]{32}$/).optional(), output: z.json().optional(), metrics: z.record(z.string(), z.number()).optional(), error: z.object({ code: z.string(), message: z.string() }).optional() }).strict().optional() }).strict();
+const stateSchema = z.object({ projectId: z.string().uuid(), request: z.record(z.string(), z.json()), taskDigest: z.string().regex(/^[a-f0-9]{64}$/), registrationKey: z.string().uuid(), runId: z.string().uuid().nullable(), traceEvidence: z.boolean().optional(), slots: z.record(z.string(), slotSchema) }).strict();
 type State = z.infer<typeof stateSchema>;
 function save(path: string | undefined, state: State) {
   if (!path) return;
@@ -43,7 +46,7 @@ function save(path: string | undefined, state: State) {
   renameSync(path + '.tmp', path);
 }
 const caseSchema = z.object({ caseId: z.string().uuid(), revisionId: z.string().uuid(), input: z.json(), expected: z.unknown(), metadata: z.record(z.string(), z.unknown()) }).passthrough();
-async function resolve(api: DatasetApi, dataset: Dataset) {
+async function resolve(api: DatasetApi, dataset: Dataset, requested?: string[]) {
   if (dataset.options.tag && dataset.options.versionId) throw new Error('Choose a dataset tag or versionId.');
   let id = dataset.name;
   if (!z.string().uuid().safeParse(id).success) {
@@ -53,17 +56,24 @@ async function resolve(api: DatasetApi, dataset: Dataset) {
     id = matches[0].id;
   }
   const suffix = dataset.options.versionId ? `?versionId=${z.string().uuid().parse(dataset.options.versionId)}` : dataset.options.tag ? `?tag=${encodeURIComponent(dataset.options.tag)}` : '';
-  const overview = z.object({ dataset: z.object({ caseCount: z.number().int().min(1).max(100) }), version: z.object({ id: z.string().uuid() }) }).parse(await api.request('GET', `/datasets/${id}${suffix}`));
+  const overview = z.object({ dataset: z.object({ caseCount: z.number().int().min(1).max(100000) }), version: z.object({ id: z.string().uuid() }) }).parse(await api.request('GET', `/datasets/${id}${suffix}`));
   const versionId = overview.version.id;
-  const page = z.object({ cases: z.array(z.object({ caseId: z.string().uuid() })), total: z.number().int() }).parse(await api.request('GET', `/datasets/${id}/cases?versionId=${versionId}&offset=0&limit=100`));
-  if (page.total !== overview.dataset.caseCount || page.cases.length !== page.total) throw new Error('Dataset enumeration is incomplete.');
+  if (!requested && overview.dataset.caseCount > 100) throw new Error('Select up to 100 cases for one run.');
+  const entries: { caseId: string }[] = [];
+  for (let offset = 0; offset < overview.dataset.caseCount; offset += 100) {
+    const page = z.object({ cases: z.array(z.object({ caseId: z.string().uuid() })), total: z.number().int() }).parse(await api.request('GET', `/datasets/${id}/cases?versionId=${versionId}&offset=${offset}&limit=100`));
+    if (page.total !== overview.dataset.caseCount || page.cases.length !== Math.min(100, page.total - offset)) throw new Error('Dataset enumeration is incomplete.');
+    entries.push(...page.cases);
+  }
+  if (requested && requested.some(id => !entries.some(item => item.caseId === id))) throw new Error('Selected cases must belong to the pinned dataset.');
   const cases = [];
-  for (const item of page.cases) cases.push(z.object({ case: caseSchema }).parse(await api.request('GET', `/datasets/${id}/cases/${item.caseId}?versionId=${versionId}`)).case);
+  for (const item of entries.filter(item => !requested || requested.includes(item.caseId))) cases.push(z.object({ case: caseSchema }).parse(await api.request('GET', `/datasets/${id}/cases/${item.caseId}?versionId=${versionId}`)).case);
   return { versionId, cases };
 }
 
 /** Resume uploads from saved outputs; an uncertain task execution is never repeated. */
 export async function runEval(options: RunEvalOptions): Promise<EvalResult> {
+  if (options.traceEvidence && !getNeatlogsProvider()) throw new Error('Initialize the Neatlogs SDK before running with trace evidence.');
   const trials = z.number().int().min(1).max(10).parse(options.trials ?? 1);
   const timeout = z.number().finite().positive().parse(options.waitTimeoutMillis ?? 300_000);
   const maxErrorRate = z.number().min(0).max(1).parse(options.maxErrorRate ?? 0);
@@ -73,14 +83,19 @@ export async function runEval(options: RunEvalOptions): Promise<EvalResult> {
   const saved = options.resume && options.statePath ? stateSchema.parse(JSON.parse(readFileSync(options.statePath, 'utf8'))) : null;
   const selected = typeof options.dataset === 'string' ? new Dataset(options.dataset) : options.dataset;
   const dataset = saved ? new Dataset(selected.name, { versionId: z.string().uuid().parse(saved.request.datasetVersionId) }) : selected;
-  const { versionId, cases } = await resolve(datasetApi, dataset);
+  const requested = options.caseIds === undefined ? undefined : z.array(z.string().uuid()).min(1).max(100).parse(options.caseIds);
+  if (requested && new Set(requested).size !== requested.length) throw new Error('Selected cases must be unique.');
+  const resolved = await resolve(datasetApi, dataset, requested);
+  const versionId = resolved.versionId;
+  if (requested && (new Set(requested).size !== requested.length || requested.some(id => !resolved.cases.some(item => item.caseId === id)))) throw new Error('Selected cases must be unique and belong to the pinned dataset.');
+  const cases = requested ? resolved.cases.filter(item => requested.includes(item.caseId)) : resolved.cases;
   const request = { datasetVersionId: versionId, caseIds: cases.map(item => item.caseId), label: z.string().trim().min(1).parse(options.label), params: options.params ?? {}, trials, deadlineSeconds: 900,
     ...(options.grading ? { grading: options.grading } : {}), ...(options.baseline ? { baseline: options.baseline } : {}), ...(options.gates ? { gates: options.gates } : {}), ...(options.git ? { git: options.git } : {}), ...(options.checks ? { checks: options.checks } : {}) };
   const taskDigest = createHash('sha256').update(options.task.toString()).digest('hex');
   const requestJson = z.record(z.string(), z.json()).parse(json(request));
-  if (saved && (JSON.stringify(saved.request) !== JSON.stringify(requestJson) || saved.projectId !== apiOptions.projectId || saved.taskDigest !== taskDigest)) throw new Error('Resume must use the same project, pinned dataset and run configuration.');
+  if (saved && (JSON.stringify(saved.request) !== JSON.stringify(requestJson) || saved.projectId !== apiOptions.projectId || saved.taskDigest !== taskDigest || Boolean(saved.traceEvidence) !== Boolean(options.traceEvidence))) throw new Error('Resume must use the same project, pinned dataset and run configuration.');
   if (!saved && options.statePath && existsSync(options.statePath)) throw new Error('State file exists; use resume or choose a new path.');
-  const state: State = saved ?? { projectId: apiOptions.projectId, request: requestJson, taskDigest, registrationKey: randomUUID(), runId: null, slots: {} };
+  const state: State = saved ?? { projectId: apiOptions.projectId, request: requestJson, taskDigest, registrationKey: randomUUID(), runId: null, traceEvidence: Boolean(options.traceEvidence), slots: {} };
   save(options.statePath, state);
   if (!state.runId) { state.runId = (await runApi.register(request, state.registrationKey)).runId; save(options.statePath, state); }
   const runId = state.runId;
@@ -94,13 +109,27 @@ export async function runEval(options: RunEvalOptions): Promise<EvalResult> {
       const params = options.params ?? {}, started = performance.now();
       const context: EvalContext = { expected: item.expected, metadata: item.metadata, trial, params, metrics: {}, param: (name, fallback) => Object.hasOwn(params, name) ? params[name] : fallback };
       try {
-        const output = json(await trace({ name: options.label, kind: 'WORKFLOW', input: item.input, attributes: { 'neatlogs.origin': 'simulation', 'neatlogs.replay.run_id': runId, 'neatlogs.replay.case_id': item.caseId, 'neatlogs.replay.trial': trial } }, () => options.task(item.input, context)));
-        slot.body = { caseId: item.caseId, trial, output, metrics: { ...context.metrics, latencyMs: performance.now() - started } };
+        let traceId = '';
+        const output = json(await trace({ name: options.label, kind: 'WORKFLOW', input: item.input, attributes: { 'neatlogs.origin': 'simulation', 'neatlogs.replay.run_id': runId, 'neatlogs.replay.case_id': item.caseId, 'neatlogs.replay.trial': trial } }, (span) => {
+          traceId = span.spanContext().traceId;
+          return options.task(item.input, context);
+        }));
+        if (options.traceEvidence) {
+          if (!/^[a-f0-9]{32}$/.test(traceId) || /^0+$/.test(traceId)) throw new Error('Initialize the Neatlogs SDK before running with trace evidence.');
+          slot.body = { caseId: item.caseId, trial, traceId };
+        } else slot.body = { caseId: item.caseId, trial, output, metrics: { ...context.metrics, latencyMs: performance.now() - started } };
       } catch (error) { slot.body = { caseId: item.caseId, trial, error: { code: error instanceof Error ? error.name.slice(0, 100) : 'TASK_ERROR', message: (error instanceof Error ? error.message : String(error)).slice(0, 1000) } }; }
       slot.executing = false; save(options.statePath, state);
     }
     if (!slot.body) throw new Error('Saved output is missing.');
-    await runApi.taskOutput(runId, slot.body, slot.key); slot.accepted = true; save(options.statePath, state);
+    if (slot.body.traceId) {
+      const sdkPackage = 'neat' + 'logs';
+      const sdk: unknown = await import(sdkPackage);
+      const flush = z.object({ flush: z.function() }).parse(sdk).flush;
+      if (!await flush()) throw new Error('Could not export the task trace. Resume after checking the SDK connection.');
+      await runApi.upload(runId, { caseId: slot.body.caseId, trial: slot.body.trial, traceId: slot.body.traceId }, { key: slot.key, waitMillis: 300_000 });
+    } else await runApi.taskOutput(runId, slot.body, slot.key);
+    slot.accepted = true; save(options.statePath, state);
   }
   await runApi.complete(runId);
   const errors = Object.values(state.slots).filter(slot => slot.body?.error).length;

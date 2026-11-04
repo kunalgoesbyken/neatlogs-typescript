@@ -1,9 +1,9 @@
 import { createServer, type Server } from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Dataset, runEval } from '../../src/evals.js';
 
 const [projectId, datasetId, versionId, caseId, revisionId, runId] = Array.from({ length: 6 }, () => randomUUID());
@@ -16,10 +16,13 @@ let uploads: Record<string, unknown>[];
 let paths: string[];
 let manyCases: string[];
 let comparisonsUntilReady = 0;
+let handoffReady = false;
 let completionKeys: string[];
 let failCompletionCount = 0;
+let gateKeys: string[];
+let failGateCount = 0;
 beforeEach(async () => {
-  uploads = []; paths = []; manyCases = []; completionKeys = []; comparisonsUntilReady = 0; failUpload = false; failCompletionCount = 0; verdict = 'pass'; directory = mkdtempSync(join(tmpdir(), 'neatlogs-eval-'));
+  uploads = []; paths = []; manyCases = []; completionKeys = []; gateKeys = []; comparisonsUntilReady = 0; handoffReady = false; failUpload = false; failCompletionCount = 0; failGateCount = 0; verdict = 'pass'; directory = mkdtempSync(join(tmpdir(), 'neatlogs-eval-'));
   server = createServer(async (request, response) => {
     const path = request.url ?? ''; paths.push(path);
     const chunks = []; for await (const chunk of request) chunks.push(Buffer.from(chunk));
@@ -30,14 +33,15 @@ beforeEach(async () => {
         const complete = comparisonsUntilReady-- <= 0;
         data = { state: complete ? 'ready' : 'pending', coverage: { complete } };
       }
+      else if (path.endsWith(`/runs/${runId}`)) data = { runId, state: 'completed', deadlineAt: '2030-01-01T00:00:00Z', itemCount: 1, completedCount: 1, failedCount: 0, pendingCount: 0, gradingHandoffState: 'dispatched' };
       else if (path.includes('/cases/') && (path.includes(`/cases/${caseId}`) || manyCases.some(id => path.includes(`/cases/${id}`)))) data = { case: { caseId: path.split('/cases/')[1]!.split('?')[0], revisionId, input: 'hello', expected: { value: 'hello' }, metadata: { language: 'en' } } };
       else if (path.includes('/cases?')) { const offset = Number(new URL(path, 'http://localhost').searchParams.get('offset')); data = manyCases.length ? { cases: manyCases.slice(offset, offset + 100).map(caseId => ({ caseId })), total: manyCases.length } : { cases: [{ caseId }], total: 1 }; }
       else data = { dataset: { caseCount: manyCases.length || 1 }, version: { id: versionId } };
     } else {
       expect(request.headers.authorization).toBe('Bearer task-token'); expect(request.headers['x-project-id']).toBe(projectId); expect(request.headers['idempotency-key']).toBeTruthy();
-      if (path.endsWith('/complete')) { completionKeys.push(String(request.headers['idempotency-key'])); if (failCompletionCount > 0) { status = 503; failCompletionCount--; } data = { runId, state: 'completed', deadlineAt: '2030-01-01T00:00:00Z', itemCount: 2, completedCount: 2, failedCount: 0, pendingCount: 0, gradingHandoffState: 'dispatched' }; }
+      if (path.endsWith('/complete')) { completionKeys.push(String(request.headers['idempotency-key'])); if (failCompletionCount > 0) { status = 503; failCompletionCount--; } data = { runId, state: 'completed', deadlineAt: '2030-01-01T00:00:00Z', itemCount: 2, completedCount: 2, failedCount: 0, pendingCount: 0, gradingHandoffState: handoffReady ? 'ready' : 'dispatched' }; }
       else if (path.endsWith('/outputs')) { if (failUpload) status = 503; else uploads.push(body); data = { outputId: randomUUID(), state: 'succeeded' }; }
-      else if (path.endsWith('/gate')) data = { verdict };
+      else if (path.endsWith('/gate')) { gateKeys.push(String(request.headers['idempotency-key'])); if (failGateCount > 0) { status = 503; failGateCount--; } data = { verdict }; }
       else data = { runId, state: path.endsWith('/complete') ? 'completed' : 'queued', deadlineAt: '2030-01-01T00:00:00Z', itemCount: 2, completedCount: 2, failedCount: 0, pendingCount: 0, gradingHandoffState: 'dispatched' };
       if (!path.endsWith('/complete') && !path.endsWith('/gate') && !path.endsWith('/outputs')) {
         const { completedCount: _completed, failedCount: _failed, pendingCount: _pending, gradingHandoffState: _handoff, ...receipt } = data as Record<string, unknown>; data = receipt;
@@ -48,7 +52,7 @@ beforeEach(async () => {
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address(); if (!address || typeof address === 'string') throw new Error('No local test address'); baseUrl = `http://127.0.0.1:${address.port}`;
 });
-afterEach(async () => { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); rmSync(directory, { recursive: true, force: true }); });
+afterEach(async () => { vi.unstubAllEnvs(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); rmSync(directory, { recursive: true, force: true }); });
 
 describe('task evaluation over the public HTTP contract', () => {
   it('resumes uncertain run completion with its original idempotency key', async () => {
@@ -60,22 +64,38 @@ describe('task evaluation over the public HTTP contract', () => {
     expect(new Set(completionKeys).size).toBe(1);
     expect(uploads).toHaveLength(1);
   });
+  it('resumes an uncertain gate with its original idempotency key', async () => {
+    const options = { dataset: datasetId!, label: 'resume gate', statePath: join(directory, 'gate.json'), api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' };
+    failGateCount = 2;
+    await expect(runEval(options)).rejects.toThrow(/HTTP 503/);
+    const result = await runEval({ ...options, resume: true });
+    expect(result.exitCode).toBe(0);
+    expect(gateKeys).toHaveLength(3);
+    expect(new Set(gateKeys).size).toBe(1);
+    expect(uploads).toHaveLength(1);
+  });
   it('waits for server-managed grades without dispatching duplicate work', async () => {
     comparisonsUntilReady = 1;
+    handoffReady = true;
     const result = await runEval({ dataset: datasetId!, label: 'graded', grading: { formVersionId: randomUUID(), evaluatorIds: [randomUUID()] }, statePath: join(directory, 'graded.json'), api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' });
     expect(result.exitCode).toBe(0);
     expect(paths.filter(path => path.includes('/comparison'))).toHaveLength(2);
+    expect(paths.findIndex(path => path.endsWith(`/runs/${runId}`))).toBeLessThan(paths.findIndex(path => path.includes('/comparison')));
     expect(paths.some(path => path.endsWith('/ai-dispatches'))).toBe(false);
   });
   it('runs each trial, carries context and maps failed gates to exit1', async () => {
     verdict = 'fail'; const seen: number[] = [];
-    const result = await runEval({ dataset: new Dataset(datasetId!, { tag: 'golden-v3' }), label: 'candidate', params: { model: 'small' }, trials: 2, gates: ['new_failures <= 0'], api: { projectId: projectId!, token: 'task-token', baseUrl }, task: (_input, context) => { seen.push(context.trial); expect(context.param('model')).toBe('small'); context.metrics.costUsd = 0.001; return { answer: 'hello' }; } });
-    expect(result.exitCode).toBe(1); expect(seen).toEqual([1, 2]); expect(uploads).toHaveLength(2); expect(paths.some(path => path.includes('?tag=golden-v3'))).toBe(true);
+    const result = await runEval({ dataset: new Dataset(datasetId!, { versionId }), label: 'candidate', params: { model: 'small' }, trials: 2, gates: ['new_failures <= 0'], api: { projectId: projectId!, token: 'task-token', baseUrl }, task: (_input, context) => { seen.push(context.trial); expect(context.param('model')).toBe('small'); context.metrics.costUsd = 0.001; return { answer: 'hello' }; } });
+    expect(result.exitCode).toBe(1); expect(seen).toEqual([1, 2]); expect(uploads).toHaveLength(2); expect(paths).toContain(`/api/v1/public/datasets/${datasetId}?versionId=${versionId}`);
   });
   it('resumes a saved upload without repeating a completed task', async () => {
     const seen: number[] = [], statePath = join(directory, 'run.json');
+    const receipt = join(directory, 'receipt');
+    vi.stubEnv('NEATLOGS_EVAL_RESULT_FILE', receipt);
     const options = { dataset: datasetId!, label: 'resume', trials: 2, statePath, api: { projectId: projectId!, token: 'task-token', baseUrl }, task: (_input: unknown, context: { trial: number }) => { seen.push(context.trial); return 'saved output'; } };
     failUpload = true; await expect(runEval(options)).rejects.toThrow(/HTTP 503/); expect(seen).toEqual([1]); expect(statSync(statePath).mode & 0o077).toBe(0);
+    expect(readFileSync(receipt, 'utf8')).toBe(runId);
+    expect(statSync(receipt).mode & 0o077).toBe(0);
     failUpload = false; const result = await runEval({ ...options, resume: true }); expect(result.exitCode).toBe(0); expect(seen).toEqual([1, 2]); expect(uploads).toHaveLength(2);
   });
   it('retains task errors and returns incomplete', async () => {
@@ -102,5 +122,14 @@ describe('task evaluation over the public HTTP contract', () => {
     failUpload = true; await expect(runEval(options)).rejects.toThrow(/HTTP 503/);
     failUpload = false; await expect(runEval({ ...options, resume: true, task: () => 'changed' })).rejects.toThrow(/same project/);
     expect(uploads).toEqual([]);
+  });
+  it('refuses a concurrent owner of the same eval state', async () => {
+    const statePath = join(directory, 'locked.json');
+    writeFileSync(`${statePath}.lock`, '{}', { mode: 0o600 });
+    let executions = 0;
+    await expect(runEval({ dataset: datasetId!, label: 'locked', statePath,
+      api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => { executions++; return 'answer'; } })).rejects.toThrow(/locked/);
+    expect(executions).toBe(0);
+    expect(paths).toEqual([]);
   });
 });

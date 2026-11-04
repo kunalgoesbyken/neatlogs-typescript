@@ -2,12 +2,13 @@ import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { z } from 'zod';
 import { DatasetApi, json, type DatasetApiOptions, type DatasetJson } from './dataset/api.js';
+import { withAllReplayLock } from './replay/all-state.js';
 import { LocalRunApi } from './replay/run-api.js';
 import { trace } from './core/context.js';
 import { getNeatlogsProvider } from './core/provider.js';
 
 export class Dataset {
-  constructor(readonly name: string, readonly options: { versionId?: string; tag?: string } = {}) {}
+  constructor(readonly name: string, readonly options: { versionId?: string } = {}) {}
 }
 export interface EvalContext {
   expected: unknown;
@@ -40,7 +41,7 @@ export interface EvalResult { runId: string; comparison: Record<string, unknown>
 const slotSchema = z.object({ key: z.string().uuid(), executing: z.boolean(), accepted: z.boolean().optional(), body: z.object({ caseId: z.string().uuid(), trial: z.number().int(), traceId: z.string().regex(/^[a-f0-9]{32}$/).optional(), output: z.json().optional(), metrics: z.record(z.string(), z.number()).optional(), error: z.object({ code: z.string(), message: z.string() }).optional() }).strict().optional() }).strict();
 const dispatchSlotSchema = z.object({ batchId: z.string().uuid(), key: z.string().uuid(), accepted: z.boolean() }).strict();
 const stateSchema = z.object({ projectId: z.string().uuid(), request: z.record(z.string(), z.json()), taskDigest: z.string().regex(/^[a-f0-9]{64}$/), registrationKey: z.string().uuid(), runId: z.string().uuid().nullable(), traceEvidence: z.boolean().optional(), slots: z.record(z.string(), slotSchema),
-  completionKey: z.string().uuid().optional(), gradingDispatch: z.object({ evaluationId: z.string().uuid(), recorded: dispatchSlotSchema, candidate: dispatchSlotSchema }).strict().optional() }).strict();
+  completionKey: z.string().uuid().optional(), gateKey: z.string().uuid().optional(), gradingDispatch: z.object({ evaluationId: z.string().uuid(), recorded: dispatchSlotSchema, candidate: dispatchSlotSchema }).strict().optional() }).strict();
 type State = z.infer<typeof stateSchema>;
 function save(path: string | undefined, state: State) {
   if (!path) return;
@@ -49,7 +50,6 @@ function save(path: string | undefined, state: State) {
 }
 const caseSchema = z.object({ caseId: z.string().uuid(), revisionId: z.string().uuid(), input: z.json(), expected: z.unknown(), metadata: z.record(z.string(), z.unknown()) }).passthrough();
 async function resolve(api: DatasetApi, dataset: Dataset, requested?: string[]) {
-  if (dataset.options.tag && dataset.options.versionId) throw new Error('Choose a dataset tag or versionId.');
   let id = dataset.name;
   if (!z.string().uuid().safeParse(id).success) {
     const list = z.object({ datasets: z.array(z.object({ id: z.string().uuid(), name: z.string() }).passthrough()) }).parse(await api.request('GET', '/datasets'));
@@ -57,7 +57,7 @@ async function resolve(api: DatasetApi, dataset: Dataset, requested?: string[]) 
     if (matches.length !== 1 || !matches[0]) throw new Error('Use a dataset UUID or one unambiguous dataset name.');
     id = matches[0].id;
   }
-  const suffix = dataset.options.versionId ? `?versionId=${z.string().uuid().parse(dataset.options.versionId)}` : dataset.options.tag ? `?tag=${encodeURIComponent(dataset.options.tag)}` : '';
+  const suffix = dataset.options.versionId ? `?versionId=${z.string().uuid().parse(dataset.options.versionId)}` : '';
   const overview = z.object({ dataset: z.object({ caseCount: z.number().int().min(1).max(100000) }), version: z.object({ id: z.string().uuid() }) }).parse(await api.request('GET', `/datasets/${id}${suffix}`));
   const versionId = overview.version.id;
   if (!requested && overview.dataset.caseCount > 100) throw new Error('Select up to 100 cases for one run.');
@@ -75,6 +75,13 @@ async function resolve(api: DatasetApi, dataset: Dataset, requested?: string[]) 
 
 /** Resume uploads from saved outputs; an uncertain task execution is never repeated. */
 export async function runEval(options: RunEvalOptions): Promise<EvalResult> {
+  if (options.statePath) {
+    return withAllReplayLock(options.statePath, statePath => runEvalLocked({ ...options, statePath }));
+  }
+  return runEvalLocked(options);
+}
+
+async function runEvalLocked(options: RunEvalOptions): Promise<EvalResult> {
   if (options.traceEvidence && !getNeatlogsProvider()) throw new Error('Initialize the Neatlogs SDK before running with trace evidence.');
   const trials = z.number().int().min(1).max(10).parse(options.trials ?? 1);
   const timeout = z.number().finite().positive().parse(options.waitTimeoutMillis ?? 300_000);
@@ -99,8 +106,13 @@ export async function runEval(options: RunEvalOptions): Promise<EvalResult> {
   if (!saved && options.statePath && existsSync(options.statePath)) throw new Error('State file exists; use resume or choose a new path.');
   const state: State = saved ?? { projectId: apiOptions.projectId, request: requestJson, taskDigest, registrationKey: randomUUID(), runId: null, traceEvidence: Boolean(options.traceEvidence), slots: {} };
   save(options.statePath, state);
-  if (!state.runId) { state.runId = (await runApi.register(request, state.registrationKey)).runId; save(options.statePath, state); }
-  const runId = state.runId;
+  const runId = state.runId ?? (await runApi.register(request, state.registrationKey)).runId;
+  const receipt = process.env.NEATLOGS_EVAL_RESULT_FILE;
+  if (receipt) {
+    try { writeFileSync(receipt, runId, { flag: 'wx', mode: 0o600 }); }
+    catch { /* A CLI activity receipt must never change the run outcome. */ }
+  }
+  if (!state.runId) { state.runId = runId; save(options.statePath, state); }
   for (const item of cases) for (let trial = 1; trial <= trials; trial++) {
     const key = `${item.caseId}:${trial}`;
     let slot = state.slots[key];
@@ -135,13 +147,20 @@ export async function runEval(options: RunEvalOptions): Promise<EvalResult> {
   }
   state.completionKey ??= randomUUID();
   save(options.statePath, state);
-  await runApi.complete(runId, state.completionKey);
+  let status = await runApi.complete(runId, state.completionKey);
   const errors = Object.values(state.slots).filter(slot => slot.body?.error).length;
   const deadline = Date.now() + timeout;
+  while (options.grading && status.state === 'completed' &&
+    (status.gradingHandoffState === 'pending' || status.gradingHandoffState === 'ready') && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, Math.min(1000, deadline - Date.now())));
+    status = await runApi.status(runId);
+  }
   let comparison = await runApi.comparison(runId);
   while (comparison.state === 'pending' && Date.now() < deadline) { await new Promise(resolve => setTimeout(resolve, Math.min(1000, deadline - Date.now()))); comparison = await runApi.comparison(runId); }
   const coverage = z.object({ complete: z.boolean() }).parse(comparison.coverage);
   if (errors / (cases.length * trials) > maxErrorRate || !coverage.complete) return { runId, comparison, gate: null, errors, exitCode: 4 };
-  const gate = await runApi.gate(runId);
+  state.gateKey ??= randomUUID();
+  save(options.statePath, state);
+  const gate = await runApi.gate(runId, state.gateKey);
   return { runId, comparison, gate, errors, exitCode: gate.verdict === 'pass' ? 0 : gate.verdict === 'fail' ? 1 : 4 };
 }

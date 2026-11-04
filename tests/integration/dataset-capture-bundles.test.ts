@@ -3,6 +3,26 @@ import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 describe('dataset capture across published package entrypoints', () => {
+  it('records a Google tool call ID on the exported tool span', () => {
+    const corePath = resolve('dist/index.mjs');
+    const integrationPath = resolve('dist/google-genai.mjs');
+    const script = `
+      import { pathToFileURL } from 'node:url';
+      const { Client, trace } = await import(pathToFileURL(${JSON.stringify(corePath)}).href);
+      const { traceTool } = await import(pathToFileURL(${JSON.stringify(integrationPath)}).href);
+      const exported = [];
+      const exporter = { export(spans, done) { exported.push(...spans); done({ code: 0 }); }, async shutdown() {}, async forceFlush() {} };
+      const client = new Client({ apiKey: 'unused', workflowName: 'tool-call-id', spanExporter: exporter });
+      try {
+        const tool = traceTool('lookup', async () => 'result', { callId: 'provider-call-123' });
+        await client.activate(() => trace({ name: 'agent', kind: 'WORKFLOW' }, () => tool({})));
+        await client.flush();
+        console.log(JSON.stringify(exported.find((span) => span.name === 'tool.lookup')?.attributes));
+      } finally { await client.shutdown(); }
+    `;
+    const attributes = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 15_000 }));
+    expect(attributes['neatlogs.tool.call_id']).toBe('provider-call-123');
+  }, 20_000);
   it.each([['mjs', 'mjs'], ['cjs', 'cjs'], ['mjs', 'cjs']])('shares the capture scope between index.%s and openai.%s', (coreFormat, integrationFormat) => {
     const corePath = resolve(`dist/index.${coreFormat}`);
     const integrationPath = resolve(`dist/openai.${integrationFormat}`);

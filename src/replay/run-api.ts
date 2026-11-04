@@ -13,7 +13,8 @@ const outputReceiptSchema = z.object({
   runId: z.string().uuid(), itemId: z.string().uuid(), outputId: z.string().uuid(), traceId: z.string().regex(/^[a-f0-9]{32}$/), state: z.literal('succeeded'),
 }).strict();
 const statusSchema = receiptSchema.extend({ completedCount: z.number().int().nonnegative(), failedCount: z.number().int().nonnegative(),
-  pendingCount: z.number().int().nonnegative(), gradingHandoffState: z.enum(['pending', 'ready', 'dispatched', 'failed']) }).strict();
+  pendingCount: z.number().int().nonnegative(), gradingHandoffState: z.enum(['pending', 'ready', 'dispatched', 'failed']),
+  grading: z.object({ evaluationId: z.string().uuid(), candidateBatchId: z.string().uuid(), recordedBatchId: z.string().uuid() }).nullable().optional() }).strict();
 export class LocalRunApiError extends Error {
   constructor(message: string, readonly status?: number, readonly code?: string) { super(message); this.name = 'LocalRunApiError'; }
 }
@@ -44,14 +45,14 @@ export class LocalRunApi {
     if (!options.token.trim()) throw new LocalRunApiError('NEATLOGS_TOKEN is required to upload a run.');
     this.origin = url.origin; this.projectId = uuid(options.projectId, 'projectId'); this.token = options.token.trim();
   }
-  private async request(path: string, body: unknown, key: string | undefined, timeout: number, method: 'GET' | 'POST' = 'POST', responseLimit = 64 * 1024): Promise<unknown> {
+  private async request(path: string, body: unknown, key: string | undefined, timeout: number, method: 'GET' | 'POST' = 'POST', responseLimit = 64 * 1024, resource: 'runs' | 'evaluations' = 'runs'): Promise<unknown> {
     const serialized = body === undefined ? undefined : serializeCaptureBody(body), controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeout);
     try {
       for (let attempt = 0; ; attempt++) {
         let response: Response;
         try {
-          response = await context.with(suppressTracing(context.active()), () => fetch(`${this.origin}/api/v1/public/runs${path}`, {
+          response = await context.with(suppressTracing(context.active()), () => fetch(`${this.origin}/api/v1/public/${resource}${path}`, {
             method, body: serialized, redirect: 'error', signal: controller.signal,
             headers: { Authorization: `Bearer ${this.token}`, 'x-project-id': this.projectId, 'Content-Type': 'application/json', ...(key ? { 'Idempotency-Key': key } : {}) },
           }));
@@ -94,9 +95,16 @@ export class LocalRunApi {
   async gate(runId: string, key: string = randomUUID()) {
     return z.object({ verdict: z.enum(['pass', 'fail', 'incomplete']) }).passthrough().parse(await this.request(`/${uuid(runId, 'runId')}/gate`, {}, key, 30_000));
   }
-  async status(runId: string) {
-    const id = uuid(runId, 'runId'), result = statusSchema.parse(await this.request(`/${id}`, undefined, undefined, 30_000, 'GET'));
+  async status(runId: string, includeGrading = false) {
+    const id = uuid(runId, 'runId'), result = statusSchema.parse(await this.request(`/${id}${includeGrading ? '?includeGrading=true' : ''}`, undefined, undefined, 30_000, 'GET'));
     if (result.runId !== id) throw new LocalRunApiError('The run status belongs to a different run.');
+    return result;
+  }
+  async dispatchGrading(evaluationId: string, batchId: string, key: string) {
+    const evaluation = uuid(evaluationId, 'evaluationId'), batch = uuid(batchId, 'batchId');
+    const result = z.object({ evaluationId: z.string().uuid(), batchId: z.string().uuid(), dispatchStatus: z.literal('accepted') }).strict()
+      .parse(await this.request(`/${evaluation}/ai-dispatches`, { batchId: batch }, uuid(key, 'Idempotency-Key'), 120_000, 'POST', 64 * 1024, 'evaluations'));
+    if (result.evaluationId !== evaluation || result.batchId !== batch) throw new LocalRunApiError('The grading receipt belongs to a different evaluation or batch.');
     return result;
   }
   async upload(runId: string, input: { caseId: string; trial: number; traceId: string }, options: { key?: string; waitMillis?: number } = {}) {

@@ -67,6 +67,7 @@ export function wrapGoogleGenAI<T extends object>(client: T): T {
 export function traceTool<TArgs = any, TResult = any>(
   name: string,
   fn: (args: TArgs) => TResult | Promise<TResult>,
+  options?: { callId?: string },
 ): (args: TArgs) => Promise<TResult> {
   return async function tracedTool(args: TArgs): Promise<TResult> {
     const tracer = getNeatlogsTracer(TRACER_NAME);
@@ -76,6 +77,7 @@ export function traceTool<TArgs = any, TResult = any>(
         attributes: {
           'neatlogs.span.kind': 'TOOL',
           'neatlogs.tool.name': name,
+          ...(options?.callId ? { 'neatlogs.tool.call_id': options.callId } : {}),
         },
       },
       getNeatlogsParentContext(),

@@ -38,7 +38,9 @@ export interface RunEvalOptions {
 }
 export interface EvalResult { runId: string; comparison: Record<string, unknown>; gate: Awaited<ReturnType<LocalRunApi['gate']>> | null; errors: number; exitCode: 0 | 1 | 4 }
 const slotSchema = z.object({ key: z.string().uuid(), executing: z.boolean(), accepted: z.boolean().optional(), body: z.object({ caseId: z.string().uuid(), trial: z.number().int(), traceId: z.string().regex(/^[a-f0-9]{32}$/).optional(), output: z.json().optional(), metrics: z.record(z.string(), z.number()).optional(), error: z.object({ code: z.string(), message: z.string() }).optional() }).strict().optional() }).strict();
-const stateSchema = z.object({ projectId: z.string().uuid(), request: z.record(z.string(), z.json()), taskDigest: z.string().regex(/^[a-f0-9]{64}$/), registrationKey: z.string().uuid(), runId: z.string().uuid().nullable(), traceEvidence: z.boolean().optional(), slots: z.record(z.string(), slotSchema) }).strict();
+const dispatchSlotSchema = z.object({ batchId: z.string().uuid(), key: z.string().uuid(), accepted: z.boolean() }).strict();
+const stateSchema = z.object({ projectId: z.string().uuid(), request: z.record(z.string(), z.json()), taskDigest: z.string().regex(/^[a-f0-9]{64}$/), registrationKey: z.string().uuid(), runId: z.string().uuid().nullable(), traceEvidence: z.boolean().optional(), slots: z.record(z.string(), slotSchema),
+  completionKey: z.string().uuid().optional(), gradingDispatch: z.object({ evaluationId: z.string().uuid(), recorded: dispatchSlotSchema, candidate: dispatchSlotSchema }).strict().optional() }).strict();
 type State = z.infer<typeof stateSchema>;
 function save(path: string | undefined, state: State) {
   if (!path) return;
@@ -131,9 +133,30 @@ export async function runEval(options: RunEvalOptions): Promise<EvalResult> {
     } else await runApi.taskOutput(runId, slot.body, slot.key);
     slot.accepted = true; save(options.statePath, state);
   }
-  await runApi.complete(runId);
+  state.completionKey ??= randomUUID();
+  save(options.statePath, state);
+  await runApi.complete(runId, state.completionKey);
   const errors = Object.values(state.slots).filter(slot => slot.body?.error).length;
   const deadline = Date.now() + timeout;
+  if (options.grading) {
+    let status = await runApi.status(runId, true);
+    while (!status.grading && Date.now() < deadline && status.gradingHandoffState !== 'failed') {
+      await new Promise(resolve => setTimeout(resolve, Math.min(1000, deadline - Date.now())));
+      status = await runApi.status(runId, true);
+    }
+    if (!status.grading) throw new Error('Grading batches are not ready. Resume this run after checking the grading worker.');
+    const { evaluationId, recordedBatchId, candidateBatchId } = status.grading;
+    if (!state.gradingDispatch) {
+      state.gradingDispatch = { evaluationId, recorded: { batchId: recordedBatchId, key: randomUUID(), accepted: false }, candidate: { batchId: candidateBatchId, key: randomUUID(), accepted: false } };
+      save(options.statePath, state);
+    }
+    const dispatch = state.gradingDispatch;
+    if (dispatch.evaluationId !== evaluationId || dispatch.recorded.batchId !== recordedBatchId || dispatch.candidate.batchId !== candidateBatchId)
+      throw new Error('Saved grading batches do not match this run.');
+    for (const batch of [dispatch.recorded, dispatch.candidate]) {
+      if (!batch.accepted) { await runApi.dispatchGrading(evaluationId, batch.batchId, batch.key); batch.accepted = true; save(options.statePath, state); }
+    }
+  }
   let comparison = await runApi.comparison(runId);
   while (comparison.state === 'pending' && Date.now() < deadline) { await new Promise(resolve => setTimeout(resolve, Math.min(1000, deadline - Date.now()))); comparison = await runApi.comparison(runId); }
   const coverage = z.object({ complete: z.boolean() }).parse(comparison.coverage);

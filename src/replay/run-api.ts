@@ -100,13 +100,6 @@ export class LocalRunApi {
     if (result.runId !== id) throw new LocalRunApiError('The run status belongs to a different run.');
     return result;
   }
-  async dispatchGrading(evaluationId: string, batchId: string, key: string) {
-    const evaluation = uuid(evaluationId, 'evaluationId'), batch = uuid(batchId, 'batchId');
-    const result = z.object({ evaluationId: z.string().uuid(), batchId: z.string().uuid(), dispatchStatus: z.literal('accepted') }).strict()
-      .parse(await this.request(`/${evaluation}/ai-dispatches`, { batchId: batch }, uuid(key, 'Idempotency-Key'), 120_000, 'POST', 64 * 1024, 'evaluations'));
-    if (result.evaluationId !== evaluation || result.batchId !== batch) throw new LocalRunApiError('The grading receipt belongs to a different evaluation or batch.');
-    return result;
-  }
   async upload(runId: string, input: { caseId: string; trial: number; traceId: string }, options: { key?: string; waitMillis?: number } = {}) {
     const key = uuid(options.key ?? randomUUID(), 'Idempotency-Key'), id = uuid(runId, 'runId');
     uuid(input.caseId, 'caseId');

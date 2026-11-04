@@ -15,32 +15,31 @@ let verdict = 'pass';
 let uploads: Record<string, unknown>[];
 let paths: string[];
 let manyCases: string[];
-let grading: { evaluationId: string; candidateBatchId: string; recordedBatchId: string } | null;
-let dispatches: { batchId: string; key: string }[];
-let failDispatchCount = 0;
+let comparisonsUntilReady = 0;
 let completionKeys: string[];
 let failCompletionCount = 0;
 beforeEach(async () => {
-  uploads = []; paths = []; manyCases = []; dispatches = []; completionKeys = []; grading = null; failUpload = false; failDispatchCount = 0; failCompletionCount = 0; verdict = 'pass'; directory = mkdtempSync(join(tmpdir(), 'neatlogs-eval-'));
+  uploads = []; paths = []; manyCases = []; completionKeys = []; comparisonsUntilReady = 0; failUpload = false; failCompletionCount = 0; verdict = 'pass'; directory = mkdtempSync(join(tmpdir(), 'neatlogs-eval-'));
   server = createServer(async (request, response) => {
     const path = request.url ?? ''; paths.push(path);
     const chunks = []; for await (const chunk of request) chunks.push(Buffer.from(chunk));
     const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {};
     let data: unknown, status = 200;
     if (request.method === 'GET') {
-      if (path.includes('/comparison')) data = { state: 'ready', coverage: { complete: true } };
-      else if (path.includes('/runs/') && path.includes('includeGrading=true')) data = { runId, state: 'completed', deadlineAt: '2030-01-01T00:00:00Z', itemCount: 1, completedCount: 1, failedCount: 0, pendingCount: 0, gradingHandoffState: 'ready', grading };
+      if (path.includes('/comparison')) {
+        const complete = comparisonsUntilReady-- <= 0;
+        data = { state: complete ? 'ready' : 'pending', coverage: { complete } };
+      }
       else if (path.includes('/cases/') && (path.includes(`/cases/${caseId}`) || manyCases.some(id => path.includes(`/cases/${id}`)))) data = { case: { caseId: path.split('/cases/')[1]!.split('?')[0], revisionId, input: 'hello', expected: { value: 'hello' }, metadata: { language: 'en' } } };
       else if (path.includes('/cases?')) { const offset = Number(new URL(path, 'http://localhost').searchParams.get('offset')); data = manyCases.length ? { cases: manyCases.slice(offset, offset + 100).map(caseId => ({ caseId })), total: manyCases.length } : { cases: [{ caseId }], total: 1 }; }
       else data = { dataset: { caseCount: manyCases.length || 1 }, version: { id: versionId } };
     } else {
       expect(request.headers.authorization).toBe('Bearer task-token'); expect(request.headers['x-project-id']).toBe(projectId); expect(request.headers['idempotency-key']).toBeTruthy();
       if (path.endsWith('/complete')) { completionKeys.push(String(request.headers['idempotency-key'])); if (failCompletionCount > 0) { status = 503; failCompletionCount--; } data = { runId, state: 'completed', deadlineAt: '2030-01-01T00:00:00Z', itemCount: 2, completedCount: 2, failedCount: 0, pendingCount: 0, gradingHandoffState: 'dispatched' }; }
-      else if (path.endsWith('/ai-dispatches')) { dispatches.push({ batchId: body.batchId, key: String(request.headers['idempotency-key']) }); if (body.batchId === grading?.candidateBatchId && failDispatchCount > 0) { status = 503; failDispatchCount--; } data = { evaluationId: grading!.evaluationId, batchId: body.batchId, dispatchStatus: 'accepted' }; }
       else if (path.endsWith('/outputs')) { if (failUpload) status = 503; else uploads.push(body); data = { outputId: randomUUID(), state: 'succeeded' }; }
       else if (path.endsWith('/gate')) data = { verdict };
       else data = { runId, state: path.endsWith('/complete') ? 'completed' : 'queued', deadlineAt: '2030-01-01T00:00:00Z', itemCount: 2, completedCount: 2, failedCount: 0, pendingCount: 0, gradingHandoffState: 'dispatched' };
-      if (!path.endsWith('/complete') && !path.endsWith('/gate') && !path.endsWith('/outputs') && !path.endsWith('/ai-dispatches')) {
+      if (!path.endsWith('/complete') && !path.endsWith('/gate') && !path.endsWith('/outputs')) {
         const { completedCount: _completed, failedCount: _failed, pendingCount: _pending, gradingHandoffState: _handoff, ...receipt } = data as Record<string, unknown>; data = receipt;
       }
     }
@@ -61,24 +60,12 @@ describe('task evaluation over the public HTTP contract', () => {
     expect(new Set(completionKeys).size).toBe(1);
     expect(uploads).toHaveLength(1);
   });
-  it('admits both pinned grading batches with separate idempotency keys', async () => {
-    grading = { evaluationId: randomUUID(), candidateBatchId: randomUUID(), recordedBatchId: randomUUID() };
+  it('waits for server-managed grades without dispatching duplicate work', async () => {
+    comparisonsUntilReady = 1;
     const result = await runEval({ dataset: datasetId!, label: 'graded', grading: { formVersionId: randomUUID(), evaluatorIds: [randomUUID()] }, statePath: join(directory, 'graded.json'), api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' });
     expect(result.exitCode).toBe(0);
-    expect(dispatches.map(item => item.batchId)).toEqual([grading.recordedBatchId, grading.candidateBatchId]);
-    expect(new Set(dispatches.map(item => item.key)).size).toBe(2);
-  });
-  it('resumes an uncertain grading admission with its original key', async () => {
-    grading = { evaluationId: randomUUID(), candidateBatchId: randomUUID(), recordedBatchId: randomUUID() };
-    failDispatchCount = 2;
-    const options = { dataset: datasetId!, label: 'graded', grading: { formVersionId: randomUUID(), evaluatorIds: [randomUUID()] }, statePath: join(directory, 'graded.json'), api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' };
-    await expect(runEval(options)).rejects.toThrow(/HTTP 503/);
-    const result = await runEval({ ...options, resume: true });
-    expect(result.exitCode).toBe(0);
-    expect(dispatches.filter(item => item.batchId === grading!.recordedBatchId)).toHaveLength(1);
-    const attempts = dispatches.filter(item => item.batchId === grading!.candidateBatchId);
-    expect(attempts).toHaveLength(3);
-    expect(new Set(attempts.map(item => item.key)).size).toBe(1);
+    expect(paths.filter(path => path.includes('/comparison'))).toHaveLength(2);
+    expect(paths.some(path => path.endsWith('/ai-dispatches'))).toBe(false);
   });
   it('runs each trial, carries context and maps failed gates to exit1', async () => {
     verdict = 'fail'; const seen: number[] = [];

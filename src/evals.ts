@@ -138,25 +138,6 @@ export async function runEval(options: RunEvalOptions): Promise<EvalResult> {
   await runApi.complete(runId, state.completionKey);
   const errors = Object.values(state.slots).filter(slot => slot.body?.error).length;
   const deadline = Date.now() + timeout;
-  if (options.grading) {
-    let status = await runApi.status(runId, true);
-    while (!status.grading && Date.now() < deadline && status.gradingHandoffState !== 'failed') {
-      await new Promise(resolve => setTimeout(resolve, Math.min(1000, deadline - Date.now())));
-      status = await runApi.status(runId, true);
-    }
-    if (!status.grading) throw new Error('Grading batches are not ready. Resume this run after checking the grading worker.');
-    const { evaluationId, recordedBatchId, candidateBatchId } = status.grading;
-    if (!state.gradingDispatch) {
-      state.gradingDispatch = { evaluationId, recorded: { batchId: recordedBatchId, key: randomUUID(), accepted: false }, candidate: { batchId: candidateBatchId, key: randomUUID(), accepted: false } };
-      save(options.statePath, state);
-    }
-    const dispatch = state.gradingDispatch;
-    if (dispatch.evaluationId !== evaluationId || dispatch.recorded.batchId !== recordedBatchId || dispatch.candidate.batchId !== candidateBatchId)
-      throw new Error('Saved grading batches do not match this run.');
-    for (const batch of [dispatch.recorded, dispatch.candidate]) {
-      if (!batch.accepted) { await runApi.dispatchGrading(evaluationId, batch.batchId, batch.key); batch.accepted = true; save(options.statePath, state); }
-    }
-  }
   let comparison = await runApi.comparison(runId);
   while (comparison.state === 'pending' && Date.now() < deadline) { await new Promise(resolve => setTimeout(resolve, Math.min(1000, deadline - Date.now()))); comparison = await runApi.comparison(runId); }
   const coverage = z.object({ complete: z.boolean() }).parse(comparison.coverage);

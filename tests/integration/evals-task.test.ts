@@ -15,6 +15,8 @@ let verdict = 'pass';
 let uploads: Record<string, unknown>[];
 let paths: string[];
 let manyCases: string[];
+let datasetPages: { datasets: { id: string; name: string }[]; nextCursor?: string | null }[];
+const grading = { formVersionId: randomUUID(), evaluatorIds: [randomUUID()] };
 let comparisonsUntilReady = 0;
 let handoffReady = false;
 let completionKeys: string[];
@@ -22,14 +24,18 @@ let failCompletionCount = 0;
 let gateKeys: string[];
 let failGateCount = 0;
 beforeEach(async () => {
-  uploads = []; paths = []; manyCases = []; completionKeys = []; gateKeys = []; comparisonsUntilReady = 0; handoffReady = false; failUpload = false; failCompletionCount = 0; failGateCount = 0; verdict = 'pass'; directory = mkdtempSync(join(tmpdir(), 'neatlogs-eval-'));
+  uploads = []; paths = []; manyCases = []; datasetPages = []; completionKeys = []; gateKeys = []; comparisonsUntilReady = 0; handoffReady = false; failUpload = false; failCompletionCount = 0; failGateCount = 0; verdict = 'pass'; directory = mkdtempSync(join(tmpdir(), 'neatlogs-eval-'));
   server = createServer(async (request, response) => {
     const path = request.url ?? ''; paths.push(path);
     const chunks = []; for await (const chunk of request) chunks.push(Buffer.from(chunk));
     const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {};
     let data: unknown, status = 200;
     if (request.method === 'GET') {
-      if (path.includes('/comparison')) {
+      if (new URL(path, 'http://localhost').pathname === '/api/v1/public/datasets') {
+        const before = new URL(path, 'http://localhost').searchParams.get('before');
+        data = datasetPages[before ? 1 : 0];
+      }
+      else if (path.includes('/comparison')) {
         const complete = comparisonsUntilReady-- <= 0;
         data = { state: complete ? 'ready' : 'pending', coverage: { complete } };
       }
@@ -55,8 +61,32 @@ beforeEach(async () => {
 afterEach(async () => { vi.unstubAllEnvs(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); rmSync(directory, { recursive: true, force: true }); });
 
 describe('task evaluation over the public HTTP contract', () => {
+  it.each([undefined, { formVersionId: randomUUID(), evaluatorIds: [] }])('rejects missing or empty grading before any request', async grading => {
+    const task = vi.fn(() => 'answer');
+    await expect(runEval({ dataset: datasetId!, label: 'missing grading', grading, api: { projectId: projectId!, token: 'task-token', baseUrl }, task })).rejects.toThrow(/grading/i);
+    expect(paths).toEqual([]);
+    expect(task).not.toHaveBeenCalled();
+  });
+  it.each([false, true])('finds older dataset names and rejects later-page duplicates: %s', async duplicate => {
+    const first = Array.from({ length: 500 }, (_, index) => ({ id: randomUUID(), name: duplicate && index === 0 ? 'support' : `other-${index}` }));
+    const cursor = first.at(-1)!.id;
+    datasetPages = [{ datasets: first, nextCursor: cursor }, { datasets: [{ id: datasetId!, name: 'support' }], nextCursor: null }];
+    const result = runEval({ grading, dataset: 'support', label: 'named', api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' });
+    if (duplicate) await expect(result).rejects.toThrow(/unambiguous/);
+    else expect((await result).exitCode).toBe(0);
+    expect(paths.slice(0, 2)).toEqual(['/api/v1/public/datasets', `/api/v1/public/datasets?before=${cursor}`]);
+    expect(uploads).toHaveLength(duplicate ? 0 : 1);
+  });
+  it.each(['missing', 'repeated'])('rejects %s catalog continuation rather than silently truncating', async failure => {
+    const first = Array.from({ length: 500 }, (_, index) => ({ id: randomUUID(), name: index === 0 ? 'support' : 'other' }));
+    const cursor = first.at(-1)!.id;
+    datasetPages = failure === 'missing' ? [{ datasets: first }] : [{ datasets: first, nextCursor: cursor }, { datasets: [], nextCursor: cursor }];
+    await expect(runEval({ grading, dataset: 'support', label: 'named', api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' })).rejects.toThrow(/pagination/i);
+    expect(uploads).toEqual([]);
+  });
+
   it('resumes uncertain run completion with its original idempotency key', async () => {
-    const options = { dataset: datasetId!, label: 'resume completion', statePath: join(directory, 'completion.json'), api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' };
+    const options = { grading, dataset: datasetId!, label: 'resume completion', statePath: join(directory, 'completion.json'), api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' };
     failCompletionCount = 2;
     await expect(runEval(options)).rejects.toThrow(/HTTP 503/);
     await runEval({ ...options, resume: true });
@@ -65,7 +95,7 @@ describe('task evaluation over the public HTTP contract', () => {
     expect(uploads).toHaveLength(1);
   });
   it('resumes an uncertain gate with its original idempotency key', async () => {
-    const options = { dataset: datasetId!, label: 'resume gate', statePath: join(directory, 'gate.json'), api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' };
+    const options = { grading, dataset: datasetId!, label: 'resume gate', statePath: join(directory, 'gate.json'), api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' };
     failGateCount = 2;
     await expect(runEval(options)).rejects.toThrow(/HTTP 503/);
     const result = await runEval({ ...options, resume: true });
@@ -85,40 +115,40 @@ describe('task evaluation over the public HTTP contract', () => {
   });
   it('runs each trial, carries context and maps failed gates to exit1', async () => {
     verdict = 'fail'; const seen: number[] = [];
-    const result = await runEval({ dataset: new Dataset(datasetId!, { versionId }), label: 'candidate', params: { model: 'small' }, trials: 2, gates: ['new_failures <= 0'], api: { projectId: projectId!, token: 'task-token', baseUrl }, task: (_input, context) => { seen.push(context.trial); expect(context.param('model')).toBe('small'); context.metrics.costUsd = 0.001; return { answer: 'hello' }; } });
+    const result = await runEval({ grading, dataset: new Dataset(datasetId!, { versionId }), label: 'candidate', params: { model: 'small' }, trials: 2, gates: ['new_failures <= 0'], api: { projectId: projectId!, token: 'task-token', baseUrl }, task: (_input, context) => { seen.push(context.trial); expect(context.param('model')).toBe('small'); context.metrics.costUsd = 0.001; return { answer: 'hello' }; } });
     expect(result.exitCode).toBe(1); expect(seen).toEqual([1, 2]); expect(uploads).toHaveLength(2); expect(paths).toContain(`/api/v1/public/datasets/${datasetId}?versionId=${versionId}`);
   });
   it('resumes a saved upload without repeating a completed task', async () => {
     const seen: number[] = [], statePath = join(directory, 'run.json');
     const receipt = join(directory, 'receipt');
     vi.stubEnv('NEATLOGS_EVAL_RESULT_FILE', receipt);
-    const options = { dataset: datasetId!, label: 'resume', trials: 2, statePath, api: { projectId: projectId!, token: 'task-token', baseUrl }, task: (_input: unknown, context: { trial: number }) => { seen.push(context.trial); return 'saved output'; } };
+    const options = { grading, dataset: datasetId!, label: 'resume', trials: 2, statePath, api: { projectId: projectId!, token: 'task-token', baseUrl }, task: (_input: unknown, context: { trial: number }) => { seen.push(context.trial); return 'saved output'; } };
     failUpload = true; await expect(runEval(options)).rejects.toThrow(/HTTP 503/); expect(seen).toEqual([1]); expect(statSync(statePath).mode & 0o077).toBe(0);
     expect(readFileSync(receipt, 'utf8')).toBe(runId);
     expect(statSync(receipt).mode & 0o077).toBe(0);
     failUpload = false; const result = await runEval({ ...options, resume: true }); expect(result.exitCode).toBe(0); expect(seen).toEqual([1, 2]); expect(uploads).toHaveLength(2);
   });
   it('retains task errors and returns incomplete', async () => {
-    const result = await runEval({ dataset: datasetId!, label: 'error', api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => { throw new Error('task failed'); } });
+    const result = await runEval({ grading, dataset: datasetId!, label: 'error', api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => { throw new Error('task failed'); } });
     expect(result.exitCode).toBe(4); expect(result.errors).toBe(1); expect(uploads[0]?.error).toEqual({ code: 'Error', message: 'task failed' });
   });
   it('does not report trace evidence when the SDK is not initialized', async () => {
     const task = () => { throw new Error('must not run'); };
-    await expect(runEval({ dataset: datasetId!, label: 'trace', traceEvidence: true, api: { projectId: projectId!, token: 'task-token', baseUrl }, task })).rejects.toThrow(/Initialize the Neatlogs SDK/);
+    await expect(runEval({ grading, dataset: datasetId!, label: 'trace', traceEvidence: true, api: { projectId: projectId!, token: 'task-token', baseUrl }, task })).rejects.toThrow(/Initialize the Neatlogs SDK/);
     expect(uploads).toEqual([]);
   });
   it('rejects cases outside the selected dataset before starting a run', async () => {
-    await expect(runEval({ dataset: datasetId!, caseIds: [randomUUID()], label: 'selection', api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' })).rejects.toThrow(/belong to the pinned dataset/);
+    await expect(runEval({ grading, dataset: datasetId!, caseIds: [randomUUID()], label: 'selection', api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' })).rejects.toThrow(/belong to the pinned dataset/);
     expect(paths.some(path => path.endsWith('/runs'))).toBe(false);
   });
   it('runs a selected case from a later dataset page', async () => {
     manyCases = Array.from({ length: 101 }, () => randomUUID());
-    const result = await runEval({ dataset: datasetId!, caseIds: [manyCases[100]!], label: 'selection', api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' });
+    const result = await runEval({ grading, dataset: datasetId!, caseIds: [manyCases[100]!], label: 'selection', api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' });
     expect(result.exitCode).toBe(0); expect(uploads).toHaveLength(1);
     expect(paths.some(path => path.includes('offset=100'))).toBe(true);
   });
   it('rejects changed task code on resume', async () => {
-    const options = { dataset: datasetId!, label: 'resume', statePath: join(directory, 'run.json'), api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'original' };
+    const options = { grading, dataset: datasetId!, label: 'resume', statePath: join(directory, 'run.json'), api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'original' };
     failUpload = true; await expect(runEval(options)).rejects.toThrow(/HTTP 503/);
     failUpload = false; await expect(runEval({ ...options, resume: true, task: () => 'changed' })).rejects.toThrow(/same project/);
     expect(uploads).toEqual([]);
@@ -127,7 +157,7 @@ describe('task evaluation over the public HTTP contract', () => {
     const statePath = join(directory, 'locked.json');
     writeFileSync(`${statePath}.lock`, '{}', { mode: 0o600 });
     let executions = 0;
-    await expect(runEval({ dataset: datasetId!, label: 'locked', statePath,
+    await expect(runEval({ grading, dataset: datasetId!, label: 'locked', statePath,
       api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => { executions++; return 'answer'; } })).rejects.toThrow(/locked/);
     expect(executions).toBe(0);
     expect(paths).toEqual([]);

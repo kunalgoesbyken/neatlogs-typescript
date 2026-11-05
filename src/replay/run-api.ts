@@ -73,7 +73,7 @@ export class LocalRunApi {
   }
   async register(input: {
     datasetVersionId: string; label: string; caseIds: string[]; trials: number;
-    grading?: { formVersionId: string; evaluatorIds: string[] }; deadlineSeconds: number;
+    grading: { formVersionId: string; evaluatorIds: string[] }; deadlineSeconds: number;
     baseline?: string; gates?: string[]; git?: { branch: string; sha?: string }; checks?: string[];
     params: Record<string, string | number | boolean | null>;
     replay?: ReplaySettings;

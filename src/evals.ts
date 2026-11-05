@@ -18,6 +18,7 @@ export interface EvalContext {
   metrics: Record<string, number>;
   param(name: string, fallback?: string | number | boolean | null): string | number | boolean | null | undefined;
 }
+const gradingSchema = z.object({ formVersionId: z.string().uuid(), evaluatorIds: z.array(z.string().uuid()).min(1).max(20) }).strict();
 export interface RunEvalOptions {
   dataset: Dataset | string;
   task: (input: DatasetJson, context: EvalContext) => unknown | Promise<unknown>;
@@ -26,7 +27,7 @@ export interface RunEvalOptions {
   trials?: number;
   baseline?: string;
   gates?: string[];
-  grading?: { formVersionId: string; evaluatorIds: string[] };
+  grading: z.infer<typeof gradingSchema>;
   checks?: string[];
   git?: { branch: string; sha?: string };
   api?: DatasetApiOptions;
@@ -52,10 +53,19 @@ const caseSchema = z.object({ caseId: z.string().uuid(), revisionId: z.string().
 async function resolve(api: DatasetApi, dataset: Dataset, requested?: string[]) {
   let id = dataset.name;
   if (!z.string().uuid().safeParse(id).success) {
-    const list = z.object({ datasets: z.array(z.object({ id: z.string().uuid(), name: z.string() }).passthrough()) }).parse(await api.request('GET', '/datasets'));
-    const matches = list.datasets.filter(item => item.name === dataset.name);
-    if (matches.length !== 1 || !matches[0]) throw new Error('Use a dataset UUID or one unambiguous dataset name.');
-    id = matches[0].id;
+    const matches = new Set<string>(), seen = new Set<string>();
+    let cursor: string | null | undefined;
+    do {
+      const page = z.object({ datasets: z.array(z.object({ id: z.string().uuid(), name: z.string() }).passthrough()).max(500), nextCursor: z.string().uuid().nullable().optional() }).parse(await api.request('GET', `/datasets${cursor ? `?before=${cursor}` : ''}`));
+      for (const item of page.datasets) if (item.name === dataset.name) matches.add(item.id);
+      if (matches.size > 1) throw new Error('Use a dataset UUID or one unambiguous dataset name.');
+      if ((page.nextCursor === undefined && page.datasets.length === 500) || (page.nextCursor && seen.has(page.nextCursor))) throw new Error('Dataset catalog pagination is incomplete; use a dataset UUID.');
+      cursor = page.nextCursor;
+      if (cursor) seen.add(cursor);
+    } while (cursor);
+    const [match] = matches;
+    if (!match) throw new Error('Use a dataset UUID or one unambiguous dataset name.');
+    id = match;
   }
   const suffix = dataset.options.versionId ? `?versionId=${z.string().uuid().parse(dataset.options.versionId)}` : '';
   const overview = z.object({ dataset: z.object({ caseCount: z.number().int().min(1).max(100000) }), version: z.object({ id: z.string().uuid() }) }).parse(await api.request('GET', `/datasets/${id}${suffix}`));
@@ -75,6 +85,7 @@ async function resolve(api: DatasetApi, dataset: Dataset, requested?: string[]) 
 
 /** Resume uploads from saved outputs; an uncertain task execution is never repeated. */
 export async function runEval(options: RunEvalOptions): Promise<EvalResult> {
+  if (!gradingSchema.safeParse(options.grading).success) throw new Error('Select valid grading with a formVersionId and 1–20 evaluatorIds.');
   if (options.statePath) {
     return withAllReplayLock(options.statePath, statePath => runEvalLocked({ ...options, statePath }));
   }
@@ -99,7 +110,7 @@ async function runEvalLocked(options: RunEvalOptions): Promise<EvalResult> {
   if (requested && (new Set(requested).size !== requested.length || requested.some(id => !resolved.cases.some(item => item.caseId === id)))) throw new Error('Selected cases must be unique and belong to the pinned dataset.');
   const cases = requested ? resolved.cases.filter(item => requested.includes(item.caseId)) : resolved.cases;
   const request = { datasetVersionId: versionId, caseIds: cases.map(item => item.caseId), label: z.string().trim().min(1).parse(options.label), params: options.params ?? {}, trials, deadlineSeconds: 900,
-    ...(options.grading ? { grading: options.grading } : {}), ...(options.baseline ? { baseline: options.baseline } : {}), ...(options.gates ? { gates: options.gates } : {}), ...(options.git ? { git: options.git } : {}), ...(options.checks ? { checks: options.checks } : {}) };
+    grading: options.grading, ...(options.baseline ? { baseline: options.baseline } : {}), ...(options.gates ? { gates: options.gates } : {}), ...(options.git ? { git: options.git } : {}), ...(options.checks ? { checks: options.checks } : {}) };
   const taskDigest = createHash('sha256').update(options.task.toString()).digest('hex');
   const requestJson = z.record(z.string(), z.json()).parse(json(request));
   if (saved && (JSON.stringify(saved.request) !== JSON.stringify(requestJson) || saved.projectId !== apiOptions.projectId || saved.taskDigest !== taskDigest || Boolean(saved.traceEvidence) !== Boolean(options.traceEvidence))) throw new Error('Resume must use the same project, pinned dataset and run configuration.');

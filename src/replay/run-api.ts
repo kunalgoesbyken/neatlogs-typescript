@@ -36,28 +36,38 @@ async function responseJson(response: Response, limit = 64 * 1024): Promise<unkn
 export class LocalRunApi {
   private readonly origin: string;
   private readonly projectId: string;
-  private readonly token: string;
+  private token: string;
+  private readonly refreshAccessToken?: DatasetApiOptions["refreshAccessToken"];
   constructor(options: DatasetApiOptions) {
     const url = new URL(options.baseUrl);
     if ((url.protocol !== 'https:' && !(url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))) ||
         url.username || url.password || url.search || url.hash || url.pathname !== '/')
       throw new LocalRunApiError('Use an HTTPS API origin; HTTP is supported only on loopback.');
     if (!options.token.trim()) throw new LocalRunApiError('NEATLOGS_TOKEN is required to upload a run.');
+    this.refreshAccessToken = options.refreshAccessToken;
     this.origin = url.origin; this.projectId = uuid(options.projectId, 'projectId'); this.token = options.token.trim();
   }
   private async request(path: string, body: unknown, key: string | undefined, timeout: number, method: 'GET' | 'POST' = 'POST', responseLimit = 64 * 1024, resource: 'runs' | 'evaluations' = 'runs'): Promise<unknown> {
     const serialized = body === undefined ? undefined : serializeCaptureBody(body), controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeout);
     try {
+      let renewed = false;
       for (let attempt = 0; ; attempt++) {
+        const sentToken = this.token;
         let response: Response;
         try {
           response = await context.with(suppressTracing(context.active()), () => fetch(`${this.origin}/api/v1/public/${resource}${path}`, {
             method, body: serialized, redirect: 'error', signal: controller.signal,
-            headers: { Authorization: `Bearer ${this.token}`, 'x-project-id': this.projectId, 'Content-Type': 'application/json', ...(key ? { 'Idempotency-Key': key } : {}) },
+            headers: { Authorization: `Bearer ${sentToken}`, 'x-project-id': this.projectId, 'Content-Type': 'application/json', ...(key ? { 'Idempotency-Key': key } : {}) },
           }));
         } catch (error) { if (attempt === 0 && !controller.signal.aborted) continue; throw error; }
         if (attempt === 0 && [500, 502, 503, 504].includes(response.status)) { await response.body?.cancel(); continue; }
+        if (response.status === 401 && !renewed && this.refreshAccessToken) {
+          await response.body?.cancel();
+          this.token = await this.refreshAccessToken(sentToken);
+          renewed = true;
+          continue;
+        }
         const raw = await responseJson(response, responseLimit);
         if (!response.ok) {
           const error = z.object({ code: z.string().optional(), error: z.union([z.string(), z.object({ code: z.string().optional() }).passthrough()]).optional() }).passthrough().safeParse(raw);

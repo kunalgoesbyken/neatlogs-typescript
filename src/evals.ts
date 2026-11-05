@@ -3,9 +3,12 @@ import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { z } from 'zod';
 import { DatasetApi, json, type DatasetApiOptions, type DatasetJson } from './dataset/api.js';
 import { withAllReplayLock } from './replay/all-state.js';
+import { taskCredentialRefresh } from './task-credentials.js';
 import { LocalRunApi } from './replay/run-api.js';
 import { trace } from './core/context.js';
 import { getNeatlogsProvider } from './core/provider.js';
+
+export const LOCAL_ROUND_TRACKING_VERSION = 1;
 
 export class Dataset {
   constructor(readonly name: string, readonly options: { versionId?: string } = {}) {}
@@ -23,6 +26,7 @@ export interface RunEvalOptions {
   dataset: Dataset | string;
   task: (input: DatasetJson, context: EvalContext) => unknown | Promise<unknown>;
   label: string;
+  local?: { experimentId: string; roundId: string; variant: "A" | "B"; attempt: number };
   params?: EvalContext['params'];
   trials?: number;
   baseline?: string;
@@ -98,7 +102,8 @@ async function runEvalLocked(options: RunEvalOptions): Promise<EvalResult> {
   const timeout = z.number().finite().positive().parse(options.waitTimeoutMillis ?? 300_000);
   const maxErrorRate = z.number().min(0).max(1).parse(options.maxErrorRate ?? 0);
   if (options.resume && !options.statePath) throw new Error('Resume requires the original statePath.');
-  const apiOptions = options.api ?? { token: process.env.NEATLOGS_TOKEN ?? '', projectId: process.env.NEATLOGS_PROJECT_ID ?? '', baseUrl: process.env.NEATLOGS_HOST ?? 'https://app.neatlogs.com' };
+  const selectedApi = options.api ?? { token: process.env.NEATLOGS_TOKEN ?? '', projectId: process.env.NEATLOGS_PROJECT_ID ?? '', baseUrl: process.env.NEATLOGS_HOST ?? 'https://app.neatlogs.com' };
+  const apiOptions = { ...selectedApi, refreshAccessToken: selectedApi.refreshAccessToken ?? taskCredentialRefresh(selectedApi) };
   const datasetApi = new DatasetApi(apiOptions), runApi = new LocalRunApi(apiOptions);
   const saved = options.resume && options.statePath ? stateSchema.parse(JSON.parse(readFileSync(options.statePath, 'utf8'))) : null;
   const selected = typeof options.dataset === 'string' ? new Dataset(options.dataset) : options.dataset;
@@ -109,7 +114,8 @@ async function runEvalLocked(options: RunEvalOptions): Promise<EvalResult> {
   const versionId = resolved.versionId;
   if (requested && (new Set(requested).size !== requested.length || requested.some(id => !resolved.cases.some(item => item.caseId === id)))) throw new Error('Selected cases must be unique and belong to the pinned dataset.');
   const cases = requested ? resolved.cases.filter(item => requested.includes(item.caseId)) : resolved.cases;
-  const request = { datasetVersionId: versionId, caseIds: cases.map(item => item.caseId), label: z.string().trim().min(1).parse(options.label), params: options.params ?? {}, trials, deadlineSeconds: 900,
+  const local = options.local ? z.object({ experimentId: z.string().uuid(), roundId: z.string().uuid(), variant: z.enum(["A", "B"]), attempt: z.number().int().min(1).max(100) }).strict().parse(options.local) : undefined;
+  const request = { ...(local ? { local } : {}), datasetVersionId: versionId, caseIds: cases.map(item => item.caseId), label: z.string().trim().min(1).parse(options.label), params: options.params ?? {}, trials, deadlineSeconds: 900,
     grading: options.grading, ...(options.baseline ? { baseline: options.baseline } : {}), ...(options.gates ? { gates: options.gates } : {}), ...(options.git ? { git: options.git } : {}), ...(options.checks ? { checks: options.checks } : {}) };
   const taskDigest = createHash('sha256').update(options.task.toString()).digest('hex');
   const requestJson = z.record(z.string(), z.json()).parse(json(request));
@@ -170,6 +176,7 @@ async function runEvalLocked(options: RunEvalOptions): Promise<EvalResult> {
   while (comparison.state === 'pending' && Date.now() < deadline) { await new Promise(resolve => setTimeout(resolve, Math.min(1000, deadline - Date.now()))); comparison = await runApi.comparison(runId); }
   const coverage = z.object({ complete: z.boolean() }).parse(comparison.coverage);
   if (errors / (cases.length * trials) > maxErrorRate || !coverage.complete) return { runId, comparison, gate: null, errors, exitCode: 4 };
+  if (!options.gates?.length) return { runId, comparison, gate: null, errors, exitCode: 0 };
   state.gateKey ??= randomUUID();
   save(options.statePath, state);
   const gate = await runApi.gate(runId, state.gateKey);

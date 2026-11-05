@@ -5,6 +5,7 @@ export type DatasetJson = null | boolean | number | string | DatasetJson[] | { [
 
 export interface DatasetApiOptions {
   token: string;
+  refreshAccessToken?: (rejectedToken: string) => Promise<string>;
   projectId: string;
   baseUrl: string;
   requestTimeoutMillis?: number;
@@ -86,7 +87,8 @@ async function boundedResponse(response: Response): Promise<unknown> {
 
 export class DatasetApi {
   private readonly baseUrl: string;
-  private readonly token: string;
+  private token: string;
+  private readonly refreshAccessToken?: DatasetApiOptions["refreshAccessToken"];
   private readonly projectId: string;
   private readonly timeout: number;
 
@@ -95,6 +97,7 @@ export class DatasetApi {
       throw new DatasetCaptureError('An explicit dataset API token is required; ingestion API keys are not reused.');
     }
     this.token = options.token.trim();
+    this.refreshAccessToken = options.refreshAccessToken;
     this.projectId = uuid(options.projectId, 'projectId');
     let url: URL;
     try { url = new URL(options.baseUrl); }
@@ -129,7 +132,10 @@ export class DatasetApi {
         ...(serialized !== undefined ? { 'Content-Type': 'application/json' } : {}),
         ...(idempotencyKey ? { 'Idempotency-Key': uuid(idempotencyKey, 'Idempotency-Key') } : {}),
       };
+      let renewed = false;
       for (let attempt = 0; ; attempt += 1) {
+        const sentToken = this.token;
+        headers.Authorization = `Bearer ${sentToken}`;
         let response: Response;
         try {
           response = await context.with(suppressTracing(context.active()), () => fetch(`${this.baseUrl}/api/v1/public${path}`, {
@@ -141,6 +147,13 @@ export class DatasetApi {
         }
         if (attempt === 0 && [500, 502, 503, 504].includes(response.status) && !controller.signal.aborted) {
           await response.body?.cancel();
+          continue;
+        }
+        if (response.status === 401 && !renewed && this.refreshAccessToken) {
+          await response.body?.cancel();
+          this.token = await this.refreshAccessToken(sentToken);
+          headers.Authorization = `Bearer ${this.token}`;
+          renewed = true;
           continue;
         }
         if (!response.ok) {

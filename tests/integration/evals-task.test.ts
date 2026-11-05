@@ -13,6 +13,7 @@ let directory: string;
 let failUpload = false;
 let verdict = 'pass';
 let uploads: Record<string, unknown>[];
+let registrations: Record<string, unknown>[];
 let paths: string[];
 let manyCases: string[];
 let datasetPages: { datasets: { id: string; name: string }[]; nextCursor?: string | null }[];
@@ -24,7 +25,7 @@ let failCompletionCount = 0;
 let gateKeys: string[];
 let failGateCount = 0;
 beforeEach(async () => {
-  uploads = []; paths = []; manyCases = []; datasetPages = []; completionKeys = []; gateKeys = []; comparisonsUntilReady = 0; handoffReady = false; failUpload = false; failCompletionCount = 0; failGateCount = 0; verdict = 'pass'; directory = mkdtempSync(join(tmpdir(), 'neatlogs-eval-'));
+  registrations = []; uploads = []; paths = []; manyCases = []; datasetPages = []; completionKeys = []; gateKeys = []; comparisonsUntilReady = 0; handoffReady = false; failUpload = false; failCompletionCount = 0; failGateCount = 0; verdict = 'pass'; directory = mkdtempSync(join(tmpdir(), 'neatlogs-eval-'));
   server = createServer(async (request, response) => {
     const path = request.url ?? ''; paths.push(path);
     const chunks = []; for await (const chunk of request) chunks.push(Buffer.from(chunk));
@@ -50,6 +51,7 @@ beforeEach(async () => {
       else if (path.endsWith('/gate')) { gateKeys.push(String(request.headers['idempotency-key'])); if (failGateCount > 0) { status = 503; failGateCount--; } data = { verdict }; }
       else data = { runId, state: path.endsWith('/complete') ? 'completed' : 'queued', deadlineAt: '2030-01-01T00:00:00Z', itemCount: 2, completedCount: 2, failedCount: 0, pendingCount: 0, gradingHandoffState: 'dispatched' };
       if (!path.endsWith('/complete') && !path.endsWith('/gate') && !path.endsWith('/outputs')) {
+        registrations.push(body);
         const { completedCount: _completed, failedCount: _failed, pendingCount: _pending, gradingHandoffState: _handoff, ...receipt } = data as Record<string, unknown>; data = receipt;
       }
     }
@@ -85,6 +87,23 @@ describe('task evaluation over the public HTTP contract', () => {
     expect(uploads).toEqual([]);
   });
 
+  it('pins round and variant identity across resume and rejects switching variants', async () => {
+    const local = { experimentId: randomUUID(), roundId: randomUUID(), variant: 'B' as const, attempt: 2 };
+    const task = vi.fn(() => 'answer');
+    const options = { grading, dataset: datasetId!, label: 'round B retry', local, statePath: join(directory, 'round.json'), api: { projectId: projectId!, token: 'task-token', baseUrl }, task };
+    await runEval(options);
+    expect(registrations[0]?.local).toEqual(local);
+    await runEval({ ...options, resume: true });
+    expect(task).toHaveBeenCalledTimes(1);
+    expect(registrations).toHaveLength(1);
+    await expect(runEval({ ...options, local: { ...local, variant: 'A' }, resume: true })).rejects.toThrow(/same project/);
+  });
+  it('completes descriptive runs without issuing an empty quality gate', async () => {
+    const result = await runEval({ grading, dataset: datasetId!, label: 'descriptive', api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' });
+    expect(result.exitCode).toBe(0);
+    expect(result.gate).toBeNull();
+    expect(gateKeys).toEqual([]);
+  });
   it('resumes uncertain run completion with its original idempotency key', async () => {
     const options = { grading, dataset: datasetId!, label: 'resume completion', statePath: join(directory, 'completion.json'), api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' };
     failCompletionCount = 2;
@@ -95,7 +114,7 @@ describe('task evaluation over the public HTTP contract', () => {
     expect(uploads).toHaveLength(1);
   });
   it('resumes an uncertain gate with its original idempotency key', async () => {
-    const options = { grading, dataset: datasetId!, label: 'resume gate', statePath: join(directory, 'gate.json'), api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' };
+    const options = { grading, dataset: datasetId!, label: 'resume gate', gates: ['error_rate <= 0'], statePath: join(directory, 'gate.json'), api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' };
     failGateCount = 2;
     await expect(runEval(options)).rejects.toThrow(/HTTP 503/);
     const result = await runEval({ ...options, resume: true });

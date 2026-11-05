@@ -66,6 +66,7 @@ export async function applyMask(
   if (spanData.attributes) delete spanData.attributes['neatlogs.replay.model_capture'];
 
   const signalType = options.signalType ?? 'span';
+  const replayTool = signalType === 'span' && [spanData.kind, spanData.attributes?.['neatlogs.span.kind'], spanData.attributes?.['openinference.span.kind']].some(kind => kind === 'TOOL' || kind === 'MCP_TOOL');
   const timeoutMs = options.timeoutMs ?? DEFAULT_MASK_TIMEOUT_MS;
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -86,7 +87,8 @@ export async function applyMask(
     const result = await Promise.race([maskPromise, timeoutPromise]);
     // null means "drop this span entirely"; undefined means "keep original"
     if (result === null) return null;
-    return result !== undefined ? result : spanData;
+    const masked = result !== undefined ? result : spanData;
+    return replayTool ? { ...masked, attributes: { ...masked.attributes, 'neatlogs.capture_fidelity': 'masked' } } : masked;
   } catch (exc) {
     const signalName = spanData?.name ?? spanData?.signal_type ?? signalType;
     logger.error(

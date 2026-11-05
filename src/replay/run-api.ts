@@ -99,8 +99,11 @@ export class LocalRunApi {
   async complete(runId: string, key: string = randomUUID()) {
     return statusSchema.parse(await this.request(`/${uuid(runId, 'runId')}/complete`, {}, key, 30_000));
   }
-  async comparison(runId: string) {
-    return z.record(z.string(), z.unknown()).parse(await this.request(`/${uuid(runId, 'runId')}/comparison`, undefined, undefined, 30_000, 'GET', 17 * 1024 * 1024));
+  /** One detail page; coverage and gate summaries describe the entire run. */
+  async comparison(runId: string, options: { baseline?: string; after?: string; limit?: number; newFailuresOnly?: boolean } = {}) {
+    const parsed = z.object({ baseline: z.string().min(1).max(200).optional(), after: z.string().min(1).max(1000).optional(), limit: z.number().int().min(1).max(100).optional(), newFailuresOnly: z.boolean().optional() }).strict().parse(options);
+    const query = new URLSearchParams(Object.entries(parsed).map(([key, value]): [string, string] => [key, String(value)]));
+    return z.object({ nextCursor: z.string().max(1000).nullable().optional() }).passthrough().parse(await this.request(`/${uuid(runId, 'runId')}/comparison${query.size ? '?' + query : ''}`, undefined, undefined, 30_000, 'GET', 17 * 1024 * 1024));
   }
   async gate(runId: string, key: string = randomUUID()) {
     return z.object({ verdict: z.enum(['pass', 'fail', 'incomplete']) }).passthrough().parse(await this.request(`/${uuid(runId, 'runId')}/gate`, {}, key, 30_000));

@@ -660,7 +660,7 @@ function placeholder(record: MediaRecord): Record<string, unknown> {
   };
 }
 
-function sanitizedCopy(value: unknown, discovered: DiscoveredMedia[]): unknown {
+function sanitizedCopy(value: unknown, discovered: DiscoveredMedia[], markLossy: () => void = () => undefined): unknown {
   const replacements = new Map<string, unknown>();
   const largeReplacements: Array<[string, unknown]> = [];
   for (const item of discovered) {
@@ -686,8 +686,10 @@ function sanitizedCopy(value: unknown, discovered: DiscoveredMedia[]): unknown {
     if (typeof node === "string") {
       const direct =
         node.length <= MAX_MEDIA_REPLACEMENT_KEY_CHARS ? replacements.get(node) : undefined;
-      if (direct !== undefined) return direct;
-      return largeReplacements.find(([original]) => original === node)?.[1] ?? node;
+      if (direct !== undefined) { if (direct !== node) markLossy(); return direct; }
+      const replacement = largeReplacements.find(([original]) => original === node)?.[1];
+      if (replacement !== undefined && replacement !== node) markLossy();
+      return replacement ?? node;
     }
     if (node instanceof Uint8Array) {
       const match = discovered.find(
@@ -695,22 +697,26 @@ function sanitizedCopy(value: unknown, discovered: DiscoveredMedia[]): unknown {
           item.binaryOriginal === node ||
           (item.bytes?.buffer === node.buffer && item.bytes.byteOffset === node.byteOffset),
       );
-      return match && ["pending-upload", "failed"].includes(String(match.record.state))
-        ? placeholder(match.record)
-        : node;
+      if (match && ["pending-upload", "failed"].includes(String(match.record.state))) {
+        markLossy();
+        return placeholder(match.record);
+      }
+      return node;
     }
     if (!node || typeof node !== "object") return node;
     if (depth > MAX_MEDIA_TRAVERSAL_DEPTH || visitedNodes >= MAX_MEDIA_TRAVERSAL_NODES) {
+      markLossy();
       return REDACTED_MEDIA_STRUCTURE;
     }
     const prior = visited.get(node);
-    if (prior) return "[CIRCULAR]";
+    if (prior) { markLossy(); return "[CIRCULAR]"; }
     visitedNodes += 1;
     if (Array.isArray(node)) {
       const result: unknown[] = [];
       visited.set(node, result);
       for (const item of node) {
         if (visitedNodes >= MAX_MEDIA_TRAVERSAL_NODES) {
+          markLossy();
           result.push(REDACTED_MEDIA_STRUCTURE);
           break;
         }
@@ -723,12 +729,14 @@ function sanitizedCopy(value: unknown, discovered: DiscoveredMedia[]): unknown {
     try {
       for (const [key, item] of Object.entries(node)) {
         if (visitedNodes >= MAX_MEDIA_TRAVERSAL_NODES) {
+          markLossy();
           result.neatlogs_truncated = REDACTED_MEDIA_STRUCTURE;
           break;
         }
         result[key] = clone(item, depth + 1);
       }
     } catch {
+      markLossy();
       return REDACTED_MEDIA_STRUCTURE;
     }
     return result;
@@ -781,6 +789,7 @@ export function captureMediaWithIndex(
     recording = typeof span.isRecording !== "function" || span.isRecording();
   } catch {
     span.setAttribute(`${prefix}.media.capture_error`, "media_capture_failed");
+    span.setAttribute('neatlogs.capture_fidelity', 'unavailable');
     return { value: REDACTED_MEDIA_STRUCTURE, count: 0 };
   }
   const spanKey = canonicalSpan(span as object);
@@ -791,6 +800,7 @@ export function captureMediaWithIndex(
     discovery = discoverMedia(value, purpose, recording && uploadsAvailable);
   } catch {
     span.setAttribute(`${prefix}.media.capture_error`, "media_capture_failed");
+    span.setAttribute('neatlogs.capture_fidelity', 'unavailable');
     return { value: REDACTED_MEDIA_STRUCTURE, count: 0 };
   }
   discovery.items.forEach((item, index) => {
@@ -858,10 +868,12 @@ export function captureMediaWithIndex(
       span.setAttribute(`${recordPrefix}.${key}`, field),
     );
   });
+  const markLossy = () => span.setAttribute('neatlogs.capture_fidelity', 'truncated');
+  if (discovery.truncated) markLossy();
   return {
     value: discovery.truncated
       ? REDACTED_MEDIA_STRUCTURE
-      : sanitizedCopy(value, discovery.items),
+      : sanitizedCopy(value, discovery.items, markLossy),
     count: discovery.items.length,
   };
 }

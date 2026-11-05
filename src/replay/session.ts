@@ -4,6 +4,7 @@ import { getActiveNeatlogsSpan } from '../core/provider.js';
 import { parseReplayRecording, replayKey, replayRunBindingSchema, type ReplayEntry, type ReplayOptions, type ReplayRecording, type ReplayStatus } from './contracts.js';
 
 type Decision = { outcome: 'HIT'; entry: ReplayEntry } | { outcome: 'MISS' | 'LIVE' };
+type Reservation = { canRestore: boolean; consume: (restore: boolean) => Decision };
 const symbol = Symbol.for('neatlogs.local_replay');
 type ReplayGlobal = typeof globalThis & { [symbol]?: AsyncLocalStorage<ReplaySession> };
 const global = globalThis as ReplayGlobal;
@@ -25,6 +26,9 @@ export class ReplaySession {
   private readonly options: ReplayOptions;
   private state: ReplayStatus;
   private used = false;
+  private sequence = 0;
+  private liveAfter = Infinity;
+  private lastConsumedHit = -1;
   private readonly checkpointIndex: number;
 
   constructor(recording: unknown, options: ReplayOptions) {
@@ -62,6 +66,7 @@ export class ReplaySession {
   }
 
   decide(kind: ReplayEntry['kind'], name: string, input: unknown, canRestore?: (output: unknown) => boolean): Decision {
+    const sequence = this.sequence++;
     if (this.state.switchedToLive || this.options.mode === 'tools_only' && kind === 'model') {
       this.state.liveCalls++;
       return { outcome: 'LIVE' };
@@ -75,6 +80,7 @@ export class ReplaySession {
     if (entry.spanId === this.options.untilSpan) {
       this.state.switchedToLive = true;
       this.state.reason = 'checkpoint';
+      this.liveAfter = Math.min(this.liveAfter, sequence);
       this.state.liveCalls++;
       return { outcome: 'LIVE' };
     }
@@ -85,13 +91,38 @@ export class ReplaySession {
     if (canRestore && !canRestore(entry.output)) return this.miss(kind, name);
     this.positions.set(key, position + 1);
     this.state.hits++;
+    this.lastConsumedHit = Math.max(this.lastConsumedHit, sequence);
     return { outcome: 'HIT', entry: structuredClone(entry) };
   }
 
-  private miss(kind: ReplayEntry['kind'], name: string): Decision {
+  /** Reserve repeated inputs in invocation order; count only consumed results. */
+  reserve(kind: ReplayEntry['kind'], name: string, input: unknown, canRestore?: (output: unknown) => boolean): Reservation {
+    const sequence = this.sequence, lastConsumedHit = this.lastConsumedHit;
+    const selected = this.decide(kind, name, input, canRestore);
+    this.lastConsumedHit = lastConsumedHit;
+    if (selected.outcome === 'HIT') this.state.hits--;
+    else this.state.liveCalls--;
+    let consumed: Decision | undefined;
+    return { canRestore: selected.outcome === 'HIT', consume: restore => {
+      if (consumed) return consumed;
+      if (selected.outcome === 'HIT') {
+        if (!restore && this.lastConsumedHit > sequence) throw new Error('Request raw-response helpers before consuming a later replayed response; HTTP metadata was not recorded.');
+        if (!restore) return consumed = this.miss(kind, name, sequence);
+        if (sequence > this.liveAfter) { this.state.liveCalls++; return consumed = { outcome: 'LIVE' }; }
+        this.state.hits++;
+        this.lastConsumedHit = Math.max(this.lastConsumedHit, sequence);
+      } else this.state.liveCalls++;
+      return consumed = selected;
+    } };
+  }
+
+  private miss(kind: ReplayEntry['kind'], name: string, sequence = this.sequence - 1): Decision {
     this.state.switchedToLive = true;
-    this.state.reason = 'missing_recording';
-    this.state.firstMiss = { kind, name };
+    if (sequence <= this.liveAfter) {
+      this.liveAfter = sequence;
+      this.state.reason = 'missing_recording';
+      this.state.firstMiss = { kind, name };
+    }
     this.state.liveCalls++;
     return { outcome: 'MISS' };
   }
@@ -120,6 +151,19 @@ export function lookupReplay(kind: ReplayEntry['kind'], name: string, input: unk
   span?.setAttribute('neatlogs.replay.outcome', decision.outcome);
   if (decision.outcome === 'HIT') span?.setAttribute('neatlogs.replay.source_span_id', decision.entry.spanId);
   return decision;
+}
+
+export function reserveReplay(kind: ReplayEntry['kind'], name: string, input: unknown, canRestore?: (output: unknown) => boolean): Reservation | null {
+  const session = current();
+  if (!session) return null;
+  const reservation = session.reserve(kind, name, input, canRestore), span = getActiveNeatlogsSpan();
+  return { canRestore: reservation.canRestore, consume: restore => {
+    const decision = reservation.consume(restore);
+    if (span) session.stamp(span);
+    span?.setAttribute('neatlogs.replay.outcome', decision.outcome);
+    if (decision.outcome === 'HIT') span?.setAttribute('neatlogs.replay.source_span_id', decision.entry.spanId);
+    return decision;
+  } };
 }
 
 /** Callers supply a decoder so cached JSON cannot masquerade as an SDK class. */

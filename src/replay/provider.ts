@@ -1,7 +1,7 @@
 import type { Span } from '@opentelemetry/api';
 import { z } from 'zod';
-import { json, type DatasetJson } from '../dataset/api.js';
-import { hasReplaySession, lookupReplay } from './session.js';
+import type { DatasetJson } from '../dataset/api.js';
+import { hasReplaySession, lookupReplay, reserveReplay } from './session.js';
 import { aliasMediaCaptureSpan } from '../core/media.js';
 
 const chatResponse = z.object({
@@ -28,13 +28,68 @@ export function isCompleteProviderResponse(operation: ReplayProviderOperation, v
   return responses[operation].safeParse(value).success;
 }
 
-/** A provider request body, without transport options or a lossy JSON conversion. */
+const MAX_PROVIDER_BYTES = 1024 * 1024;
+const transportKeys = /^(?:api_?key|authorization|proxyAuthorization|headers|extraHeaders|httpOptions|abortSignal|credentials|access_token|client_secret)$/i;
+
+/** Copy actual data properties, never SDK getters, toJSON hooks, or reconstructed messages. */
+export function providerData(value: unknown, response = false): DatasetJson {
+  let bytes = 0;
+  let nodes = 0;
+  const ancestors = new Set<object>();
+  const visit = (item: unknown, depth: number): DatasetJson => {
+    if (++nodes > 4096 || depth > 32) throw new Error('Provider capture exceeds traversal limit.');
+    if (typeof item === 'string') {
+      bytes += Buffer.byteLength(item);
+      if (bytes > MAX_PROVIDER_BYTES) throw new Error('Provider capture exceeds size limit.');
+      return item;
+    }
+    if (item === null || typeof item === 'boolean' || typeof item === 'number' && Number.isFinite(item)) return item;
+    if (typeof item !== 'object' || item === null || ancestors.has(item)) throw new Error('Provider capture is not JSON.');
+    if ((!response || depth > 0) && !Array.isArray(item) && Object.getPrototypeOf(item) !== Object.prototype && Object.getPrototypeOf(item) !== null) throw new Error('SDK object is not JSON.');
+    ancestors.add(item);
+    try {
+      if (Array.isArray(item)) {
+        if (item.length > 4096 || Reflect.ownKeys(item).length !== item.length + 1) throw new Error('Array is not plain JSON.');
+        const values: DatasetJson[] = [];
+        for (let index = 0; index < item.length; index++) {
+          const property = Object.getOwnPropertyDescriptor(item, String(index));
+          if (!property || !('value' in property) || !property.enumerable) throw new Error('Array is not plain JSON.');
+          values.push(visit(property.value, depth + 1));
+        }
+        return values;
+      }
+      const entries: Array<[string, DatasetJson]> = [];
+      for (const key of Reflect.ownKeys(item)) {
+        if (typeof key !== 'string') throw new Error('Symbol data cannot be captured.');
+        if (response && depth === 0 && ['sdkHttpResponse', '_request_id'].includes(key)) continue;
+        if (transportKeys.test(key) || ['__proto__', 'prototype', 'constructor'].includes(key)) throw new Error('Transport data cannot be captured.');
+        const descriptor = Object.getOwnPropertyDescriptor(item, key);
+        if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) throw new Error('Hidden or computed data cannot be captured.');
+        if (descriptor.value === undefined) continue;
+        bytes += Buffer.byteLength(key);
+        if (bytes > MAX_PROVIDER_BYTES) throw new Error('Provider capture exceeds size limit.');
+        entries.push([key, visit(descriptor.value, depth + 1)]);
+      }
+      return Object.fromEntries(entries);
+    } finally {
+      ancestors.delete(item);
+    }
+  };
+  return visit(value, 0);
+}
+
+/** Match provider serialization while rejecting invalid values and array elements. */
 export function providerReplayInput(value: unknown): DatasetJson {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return json(value);
-  if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return json(value);
-  // Provider SDKs omit undefined optional object fields when serializing a body.
-  const defined = Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined));
-  return json(defined);
+  return providerData(value);
+}
+
+/** Keep API-call order independent of when a caller consumes its promise. */
+export function prepareProviderReplay(operation: ReplayProviderOperation, input: unknown, supported: boolean): { canRestore: boolean; consume: (restore: boolean) => unknown | undefined } | null {
+  if (!hasReplaySession()) return null;
+  let request: DatasetJson | undefined;
+  if (supported) { try { request = providerReplayInput(input); } catch { /* Unsupported requests stay live. */ } }
+  const reservation = reserveReplay('model', operation, request, value => isCompleteProviderResponse(operation, value))!;
+  return { canRestore: reservation.canRestore, consume: restore => { const decision = reservation.consume(restore); return decision.outcome === 'HIT' ? decision.entry.output : undefined; } };
 }
 
 /** Missing, incomplete and unsupported recordings make the remaining run live. */

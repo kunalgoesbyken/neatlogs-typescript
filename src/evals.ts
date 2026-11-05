@@ -1,12 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { z } from 'zod';
-import { DatasetApi, json, type DatasetApiOptions, type DatasetJson } from './dataset/api.js';
+import { DatasetApi, DatasetCaptureError, json, serializeCaptureBody, type DatasetApiOptions, type DatasetJson } from './dataset/api.js';
 import { withAllReplayLock } from './replay/all-state.js';
 import { taskCredentialRefresh } from './task-credentials.js';
 import { LocalRunApi } from './replay/run-api.js';
 import { trace } from './core/context.js';
-import { getNeatlogsProvider } from './core/provider.js';
+import { getNeatlogsProvider, runWithFreshNeatlogsContext } from './core/provider.js';
+import { assertCaptureProvider } from './dataset/capture-scope.js';
 
 export const LOCAL_ROUND_TRACKING_VERSION = 1;
 
@@ -42,16 +43,32 @@ export interface RunEvalOptions {
   traceEvidence?: boolean;
   caseIds?: string[];
 }
-export interface EvalResult { runId: string; comparison: Record<string, unknown>; gate: Awaited<ReturnType<LocalRunApi['gate']>> | null; errors: number; exitCode: 0 | 1 | 4 }
+export interface EvalResult { runId: string; comparison: Awaited<ReturnType<LocalRunApi['comparison']>>; gate: Awaited<ReturnType<LocalRunApi['gate']>> | null; errors: number; exitCode: 0 | 1 | 4 }
 const slotSchema = z.object({ key: z.string().uuid(), executing: z.boolean(), accepted: z.boolean().optional(), body: z.object({ caseId: z.string().uuid(), trial: z.number().int(), traceId: z.string().regex(/^[a-f0-9]{32}$/).optional(), output: z.json().optional(), metrics: z.record(z.string(), z.number()).optional(), error: z.object({ code: z.string(), message: z.string() }).optional() }).strict().optional() }).strict();
 const dispatchSlotSchema = z.object({ batchId: z.string().uuid(), key: z.string().uuid(), accepted: z.boolean() }).strict();
 const stateSchema = z.object({ projectId: z.string().uuid(), request: z.record(z.string(), z.json()), taskDigest: z.string().regex(/^[a-f0-9]{64}$/), registrationKey: z.string().uuid(), runId: z.string().uuid().nullable(), traceEvidence: z.boolean().optional(), slots: z.record(z.string(), slotSchema),
   completionKey: z.string().uuid().optional(), gateKey: z.string().uuid().optional(), gradingDispatch: z.object({ evaluationId: z.string().uuid(), recorded: dispatchSlotSchema, candidate: dispatchSlotSchema }).strict().optional() }).strict();
 type State = z.infer<typeof stateSchema>;
+function boundedOutput(body: NonNullable<State['slots'][string]['body']>): NonNullable<State['slots'][string]['body']> {
+  try {
+    if (body.metrics && Object.keys(body.metrics).some(key => key.length > 100)) throw new DatasetCaptureError('Task metric names must be at most 100 UTF-16 units.');
+    serializeCaptureBody(body); return body;
+  }
+  catch (error) {
+    if (!(error instanceof DatasetCaptureError)) throw error;
+    return { caseId: body.caseId, trial: body.trial, error: {
+      code: error.message.includes('64 KiB') ? 'OUTPUT_TOO_LARGE' : 'INVALID_TASK_OUTPUT',
+      message: `The task output cannot be uploaded losslessly: ${error.message}. No output was truncated or task re-executed.`,
+    } };
+  }
+}
 function save(path: string | undefined, state: State) {
   if (!path) return;
-  writeFileSync(path + '.tmp', JSON.stringify(state), { mode: 0o600 });
-  renameSync(path + '.tmp', path);
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporary, JSON.stringify(state), { mode: 0o600, flag: 'wx' });
+    renameSync(temporary, path);
+  } finally { rmSync(temporary, { force: true }); }
 }
 const caseSchema = z.object({ caseId: z.string().uuid(), revisionId: z.string().uuid(), input: z.json(), expected: z.unknown(), metadata: z.record(z.string(), z.unknown()) }).passthrough();
 async function resolve(api: DatasetApi, dataset: Dataset, requested?: string[]) {
@@ -87,9 +104,10 @@ async function resolve(api: DatasetApi, dataset: Dataset, requested?: string[]) 
   return { versionId, cases };
 }
 
-/** Resume uploads from saved outputs; an uncertain task execution is never repeated. */
+/** Resume saved outputs without repeating uncertain work. The returned comparison is one detail page; follow nextCursor with LocalRunApi.comparison for more rows. */
 export async function runEval(options: RunEvalOptions): Promise<EvalResult> {
   if (!gradingSchema.safeParse(options.grading).success) throw new Error('Select valid grading with a formVersionId and 1–20 evaluatorIds.');
+  if ((options.maxErrorRate ?? 0) !== 0) throw new Error('maxErrorRate must be zero: graded runs require every selected case to complete.');
   if (options.statePath) {
     return withAllReplayLock(options.statePath, statePath => runEvalLocked({ ...options, statePath }));
   }
@@ -97,7 +115,9 @@ export async function runEval(options: RunEvalOptions): Promise<EvalResult> {
 }
 
 async function runEvalLocked(options: RunEvalOptions): Promise<EvalResult> {
-  if (options.traceEvidence && !getNeatlogsProvider()) throw new Error('Initialize the Neatlogs SDK before running with trace evidence.');
+  const provider = getNeatlogsProvider();
+  if (options.traceEvidence && !provider) throw new Error('Initialize the Neatlogs SDK before running with trace evidence.');
+  const flushTrace = options.traceEvidence && provider ? assertCaptureProvider(provider) : null;
   const trials = z.number().int().min(1).max(10).parse(options.trials ?? 1);
   const timeout = z.number().finite().positive().parse(options.waitTimeoutMillis ?? 300_000);
   const maxErrorRate = z.number().min(0).max(1).parse(options.maxErrorRate ?? 0);
@@ -141,23 +161,23 @@ async function runEvalLocked(options: RunEvalOptions): Promise<EvalResult> {
       const context: EvalContext = { expected: item.expected, metadata: item.metadata, trial, params, metrics: {}, param: (name, fallback) => Object.hasOwn(params, name) ? params[name] : fallback };
       try {
         let traceId = '';
-        const output = json(await trace({ name: options.label, kind: 'WORKFLOW', input: item.input, attributes: { 'neatlogs.origin': 'simulation', 'neatlogs.replay.run_id': runId, 'neatlogs.replay.case_id': item.caseId, 'neatlogs.replay.trial': trial } }, (span) => {
+        const output = json(await runWithFreshNeatlogsContext(() => trace({ name: options.label, kind: 'WORKFLOW', input: item.input, attributes: { 'neatlogs.origin': 'simulation', 'neatlogs.replay.run_id': runId, 'neatlogs.replay.case_id': item.caseId, 'neatlogs.replay.trial': trial } }, (span) => {
           traceId = span.spanContext().traceId;
           return options.task(item.input, context);
-        }));
+        })));
         if (options.traceEvidence) {
           if (!/^[a-f0-9]{32}$/.test(traceId) || /^0+$/.test(traceId)) throw new Error('Initialize the Neatlogs SDK before running with trace evidence.');
           slot.body = { caseId: item.caseId, trial, traceId };
         } else slot.body = { caseId: item.caseId, trial, output, metrics: { ...context.metrics, latencyMs: performance.now() - started } };
       } catch (error) { slot.body = { caseId: item.caseId, trial, error: { code: error instanceof Error ? error.name.slice(0, 100) : 'TASK_ERROR', message: (error instanceof Error ? error.message : String(error)).slice(0, 1000) } }; }
+      slot.body = boundedOutput(slot.body);
       slot.executing = false; save(options.statePath, state);
     }
     if (!slot.body) throw new Error('Saved output is missing.');
+    const body = boundedOutput(slot.body);
+    if (body !== slot.body) { slot.body = body; save(options.statePath, state); }
     if (slot.body.traceId) {
-      const sdkPackage = 'neat' + 'logs';
-      const sdk: unknown = await import(sdkPackage);
-      const flush = z.object({ flush: z.function() }).parse(sdk).flush;
-      if (!await flush()) throw new Error('Could not export the task trace. Resume after checking the SDK connection.');
+      if (!flushTrace || !await flushTrace()) throw new Error('Could not export the task trace. Resume after checking the SDK connection.');
       await runApi.upload(runId, { caseId: slot.body.caseId, trial: slot.body.trial, traceId: slot.body.traceId }, { key: slot.key, waitMillis: 300_000 });
     } else await runApi.taskOutput(runId, slot.body, slot.key);
     slot.accepted = true; save(options.statePath, state);

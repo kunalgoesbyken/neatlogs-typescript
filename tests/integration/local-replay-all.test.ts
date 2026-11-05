@@ -5,7 +5,8 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { runSimulateCli } from '../../src/simulate-cli.js';
 import { DatasetApi } from '../../src/dataset/api.js';
 import { enumerateSavedDataset, datasetSelectionDigest } from '../../src/replay/all-selection.js';
 import { agentConfigDigest, createAllReplayState, readAllReplayState, saveAllReplayState, withAllReplayLock, type AllReplayConfiguration } from '../../src/replay/all-state.js';
@@ -28,6 +29,20 @@ afterEach(async () => {
 });
 
 describe('entire saved dataset replay', () => {
+  it('rejects a whole-dataset checkpoint before any registration, file read or state creation', async () => {
+    const path = await workspace();
+    const fetch = vi.fn();
+    vi.stubGlobal('fetch', fetch);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const result = await runSimulateCli(['simulate', 'local', '--dataset', ids.dataset, '--version', ids.version, '--all', '--state', join(path, 'state.json'), '--until-span', 'checkpoint-for-one-trace', '--agent', join(path, 'missing.yaml')]);
+      expect(result).not.toBe(0);
+      expect(stderr.mock.calls.map(([value]) => value).join('')).toMatch(/checkpoints belong to individual recordings/);
+      expect(fetch).not.toHaveBeenCalled();
+      await expect(readFile(join(path, 'state.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally { stderr.mockRestore(); vi.unstubAllGlobals(); }
+  });
+
   it('enumerates all201 immutable members in three bounded HTTP pages without latest-version drift', async () => {
     const cases = members(201), offsets: number[] = [];
     const baseUrl = await serve((request, response) => {

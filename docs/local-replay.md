@@ -71,6 +71,8 @@ const result = await session.run(() => runAgent(input));
 console.log(session.getStatus());
 ```
 
+OpenAI HTTP response helpers (`withResponse` and `asResponse`) must be selected before consuming the response. They execute a recorded live miss because saved model data does not include faithful HTTP metadata. Calling a raw helper after consuming its cached response, or after consuming a later reserved cached response, rejects explicitly without making an additional request. Duplicate requests reserve recorded responses in invocation order, independently of await order.
+
 The CLI accepts `--until-span ID` for a compatible recording. Replay sessions are isolated between concurrent callbacks and can be used once. Nested sessions are rejected.
 
 ## Save results in Runs
@@ -95,7 +97,7 @@ Without `--upload`, the same command keeps results local. A local recording file
 
 ## Entire saved dataset
 
-Use `--all` instead of repeating `--case`. A version UUID is required, so later edits to the dataset cannot change this selection.
+Use `--all` instead of repeating `--case`. Whole-dataset replay supports `tools_only`; `--all` with `--until-span` is rejected before registration because each recording has its own checkpoint IDs. A version UUID is required, so later edits to the dataset cannot change this selection.
 
 ```sh
 neatlogs simulate local \
@@ -120,3 +122,9 @@ neatlogs simulate local --resume .neatlogs/replays/my-run.json
 Only `--resume` and optional `--json` are accepted when continuing. The CLI reuses registration keys and retries an already produced trace upload without running that command again. Accepted attempts are skipped. Closed or expired batches cannot start more commands. Failed commands are not automatically repeated. If a process died while a command was running, its outcome is unknown and continuation stops for inspection. An abrupt process exit can leave a `.lock` file; remove it only after checking that no process still owns the saved run. Agent YAML is checked on resume, but the CLI does not snapshot your application's source code.
 
 `--all` cannot be combined with `--case` or `--recording`. Without `--upload`, the same selection runs locally and keeps progress in the state file. In the app, a saved batch's **Run again** command selects that batch's exact examples; it does not silently repeat the entire dataset.
+
+## Task evaluation comparison pages
+
+Graded runs require every selected case to complete; `maxErrorRate` must stay at its default zero. A failed attempt produces an incomplete comparison, never a relaxed quality pass.
+
+`runEval` returns the first detail page in `result.comparison`. Its coverage, question summaries and server-side gates describe the whole run. If `nextCursor` is present, use `LocalRunApi.comparison(runId, { after: nextCursor, limit: 100, baseline })` to read the next page. Preserve the same baseline on every page (`saved` or `run:<UUID>`). The method also supports `newFailuresOnly`; the server validates baseline compatibility and cursor membership.

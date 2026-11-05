@@ -1,10 +1,15 @@
 import { createServer, type Server } from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, lstatSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Dataset, runEval } from '../../src/evals.js';
+import { Client } from '../../src/core/client.js';
+import { trace } from '../../src/core/context.js';
+import { span } from '../../src/decorators/index.js';
+import { LocalRunApi } from '../../src/replay/run-api.js';
+import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
 
 const [projectId, datasetId, versionId, caseId, revisionId, runId] = Array.from({ length: 6 }, () => randomUUID());
 let server: Server;
@@ -15,6 +20,7 @@ let verdict = 'pass';
 let uploads: Record<string, unknown>[];
 let registrations: Record<string, unknown>[];
 let paths: string[];
+let catalogHeaders: (string | undefined)[];
 let manyCases: string[];
 let datasetPages: { datasets: { id: string; name: string }[]; nextCursor?: string | null }[];
 const grading = { formVersionId: randomUUID(), evaluatorIds: [randomUUID()] };
@@ -24,8 +30,13 @@ let completionKeys: string[];
 let failCompletionCount = 0;
 let gateKeys: string[];
 let failGateCount = 0;
+let comparisonRows: { key: string }[] = [];
+let exported: ReadableSpan[] = [];
+let evidenceAtUpload: ReadableSpan[][] = [];
+const clients: Client[] = [];
 beforeEach(async () => {
-  registrations = []; uploads = []; paths = []; manyCases = []; datasetPages = []; completionKeys = []; gateKeys = []; comparisonsUntilReady = 0; handoffReady = false; failUpload = false; failCompletionCount = 0; failGateCount = 0; verdict = 'pass'; directory = mkdtempSync(join(tmpdir(), 'neatlogs-eval-'));
+  comparisonRows = []; exported = []; evidenceAtUpload = [];
+  registrations = []; uploads = []; paths = []; catalogHeaders = []; manyCases = []; datasetPages = []; completionKeys = []; gateKeys = []; comparisonsUntilReady = 0; handoffReady = false; failUpload = false; failCompletionCount = 0; failGateCount = 0; verdict = 'pass'; directory = mkdtempSync(join(tmpdir(), 'neatlogs-eval-'));
   server = createServer(async (request, response) => {
     const path = request.url ?? ''; paths.push(path);
     const chunks = []; for await (const chunk of request) chunks.push(Buffer.from(chunk));
@@ -33,12 +44,19 @@ beforeEach(async () => {
     let data: unknown, status = 200;
     if (request.method === 'GET') {
       if (new URL(path, 'http://localhost').pathname === '/api/v1/public/datasets') {
+        catalogHeaders.push(request.headers.prefer);
+        expect(request.headers.authorization).toBe('Bearer task-token');
+        expect(request.headers['x-project-id']).toBe(projectId);
         const before = new URL(path, 'http://localhost').searchParams.get('before');
         data = datasetPages[before ? 1 : 0];
       }
       else if (path.includes('/comparison')) {
         const complete = comparisonsUntilReady-- <= 0;
-        data = { state: complete ? 'ready' : 'pending', coverage: { complete } };
+        const after = new URL(path, 'http://localhost').searchParams.get('after');
+        const start = after ? comparisonRows.findIndex(row => row.key === after) + 1 : 0;
+        const limit = Number(new URL(path, 'http://localhost').searchParams.get('limit') ?? 30);
+        const page = comparisonRows.slice(start, start + limit);
+        data = { state: complete ? 'ready' : 'pending', coverage: { complete }, ...(comparisonRows.length ? { pairs: page, nextCursor: start + page.length < comparisonRows.length ? page.at(-1)?.key : null, questionSummaries: [{ questionId: 'quality', total: comparisonRows.length }] } : {}) };
       }
       else if (path.endsWith(`/runs/${runId}`)) data = { runId, state: 'completed', deadlineAt: '2030-01-01T00:00:00Z', itemCount: 1, completedCount: 1, failedCount: 0, pendingCount: 0, gradingHandoffState: 'dispatched' };
       else if (path.includes('/cases/') && (path.includes(`/cases/${caseId}`) || manyCases.some(id => path.includes(`/cases/${id}`)))) data = { case: { caseId: path.split('/cases/')[1]!.split('?')[0], revisionId, input: 'hello', expected: { value: 'hello' }, metadata: { language: 'en' } } };
@@ -47,7 +65,7 @@ beforeEach(async () => {
     } else {
       expect(request.headers.authorization).toBe('Bearer task-token'); expect(request.headers['x-project-id']).toBe(projectId); expect(request.headers['idempotency-key']).toBeTruthy();
       if (path.endsWith('/complete')) { completionKeys.push(String(request.headers['idempotency-key'])); if (failCompletionCount > 0) { status = 503; failCompletionCount--; } data = { runId, state: 'completed', deadlineAt: '2030-01-01T00:00:00Z', itemCount: 2, completedCount: 2, failedCount: 0, pendingCount: 0, gradingHandoffState: handoffReady ? 'ready' : 'dispatched' }; }
-      else if (path.endsWith('/outputs')) { if (failUpload) status = 503; else uploads.push(body); data = { outputId: randomUUID(), state: 'succeeded' }; }
+      else if (path.endsWith('/outputs')) { if (failUpload) status = 503; else uploads.push(body); data = body.traceId ? { runId, itemId: randomUUID(), outputId: randomUUID(), traceId: body.traceId, state: 'succeeded' } : { outputId: randomUUID(), state: 'succeeded' }; if (body.traceId) evidenceAtUpload.push([...exported]); }
       else if (path.endsWith('/gate')) { gateKeys.push(String(request.headers['idempotency-key'])); if (failGateCount > 0) { status = 503; failGateCount--; } data = { verdict }; }
       else data = { runId, state: path.endsWith('/complete') ? 'completed' : 'queued', deadlineAt: '2030-01-01T00:00:00Z', itemCount: 2, completedCount: 2, failedCount: 0, pendingCount: 0, gradingHandoffState: 'dispatched' };
       if (!path.endsWith('/complete') && !path.endsWith('/gate') && !path.endsWith('/outputs')) {
@@ -60,7 +78,7 @@ beforeEach(async () => {
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address(); if (!address || typeof address === 'string') throw new Error('No local test address'); baseUrl = `http://127.0.0.1:${address.port}`;
 });
-afterEach(async () => { vi.unstubAllEnvs(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); rmSync(directory, { recursive: true, force: true }); });
+afterEach(async () => { await Promise.all(clients.splice(0).map(client => client.shutdown())); vi.unstubAllEnvs(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); rmSync(directory, { recursive: true, force: true }); });
 
 describe('task evaluation over the public HTTP contract', () => {
   it.each([undefined, { formVersionId: randomUUID(), evaluatorIds: [] }])('rejects missing or empty grading before any request', async grading => {
@@ -68,6 +86,13 @@ describe('task evaluation over the public HTTP contract', () => {
     await expect(runEval({ dataset: datasetId!, label: 'missing grading', grading, api: { projectId: projectId!, token: 'task-token', baseUrl }, task })).rejects.toThrow(/grading/i);
     expect(paths).toEqual([]);
     expect(task).not.toHaveBeenCalled();
+  });
+  it('rejects nonzero error tolerance before task, state or API work for graded runs', async () => {
+    const task = vi.fn(() => 'answer'), statePath = join(directory, 'unsupported-tolerance.json');
+    await expect(runEval({ grading, dataset: datasetId!, label: 'tolerance', maxErrorRate: 0.1, statePath, api: { projectId: projectId!, token: 'task-token', baseUrl }, task })).rejects.toThrow(/maxErrorRate must be zero/);
+    expect(paths).toEqual([]);
+    expect(task).not.toHaveBeenCalled();
+    expect(() => statSync(statePath)).toThrow();
   });
   it.each([false, true])('finds older dataset names and rejects later-page duplicates: %s', async duplicate => {
     const first = Array.from({ length: 500 }, (_, index) => ({ id: randomUUID(), name: duplicate && index === 0 ? 'support' : `other-${index}` }));
@@ -77,7 +102,15 @@ describe('task evaluation over the public HTTP contract', () => {
     if (duplicate) await expect(result).rejects.toThrow(/unambiguous/);
     else expect((await result).exitCode).toBe(0);
     expect(paths.slice(0, 2)).toEqual(['/api/v1/public/datasets', `/api/v1/public/datasets?before=${cursor}`]);
+    expect(catalogHeaders).toEqual(['pagination=cursor', 'pagination=cursor']);
     expect(uploads).toHaveLength(duplicate ? 0 : 1);
+  });
+  it('accepts a complete legacy catalog without a cursor field', async () => {
+    datasetPages = [{ datasets: [{ id: datasetId!, name: 'support' }] }];
+    const result = await runEval({ grading, dataset: 'support', label: 'legacy catalog', api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' });
+    expect(result.exitCode).toBe(0);
+    expect(uploads).toHaveLength(1);
+    expect(catalogHeaders).toEqual(['pagination=cursor']);
   });
   it.each(['missing', 'repeated'])('rejects %s catalog continuation rather than silently truncating', async failure => {
     const first = Array.from({ length: 500 }, (_, index) => ({ id: randomUUID(), name: index === 0 ? 'support' : 'other' }));
@@ -104,6 +137,92 @@ describe('task evaluation over the public HTTP contract', () => {
     expect(result.gate).toBeNull();
     expect(gateKeys).toEqual([]);
   });
+  it.each(['saved', `run:${randomUUID()}`])('exposes remaining comparison pages with whole-run summaries for %s baselines', async baseline => {
+    manyCases = Array.from({ length: 31 }, () => randomUUID());
+    comparisonRows = manyCases.map(key => ({ key }));
+    const result = await runEval({ grading, dataset: datasetId!, label: 'paged', baseline, api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' });
+    expect(uploads).toHaveLength(31);
+    expect(result.comparison.pairs).toHaveLength(30);
+    expect(result.comparison.nextCursor).toBe(manyCases[29]);
+    const api = new LocalRunApi({ projectId: projectId!, token: 'task-token', baseUrl });
+    const next = await api.comparison(result.runId, { baseline, after: result.comparison.nextCursor!, limit: 100 });
+    expect(next.pairs).toEqual([{ key: manyCases[30] }]);
+    expect(next.nextCursor).toBeNull();
+    expect(next.questionSummaries).toEqual(result.comparison.questionSummaries);
+    expect(next.coverage).toEqual({ complete: true });
+    expect(paths.at(-1)).toContain(`baseline=${encodeURIComponent(baseline)}`);
+  });
+
+  it.each([false, true])('exports isolated root evidence and completed masking from an initialized Client, nested=%s', async nested => {
+    const client = new Client({ apiKey: 'test-ingest', workflowName: 'eval-test', captureLogs: false, flushInterval: 600,
+      mask: async data => { await Promise.resolve(); data.attributes['test.mask.complete'] = true; return data; },
+      spanExporter: { export(spans, callback) { exported.push(...spans); callback({ code: 0 }); }, async shutdown() {}, async forceFlush() {} },
+    });
+    clients.push(client);
+    const lookup = span({ kind: 'TOOL', name: 'lookup' }, async (value: unknown) => ({ answer: value }));
+    let outerId: string | undefined;
+    const run = () => runEval({ grading, dataset: datasetId!, label: 'isolated-task', traceEvidence: true, api: { projectId: projectId!, token: 'task-token', baseUrl }, task: lookup });
+    const result = await client.activate(() => nested ? trace({ name: 'caller', kind: 'WORKFLOW' }, parent => { outerId = parent.spanContext().traceId; return run(); }) : run());
+    expect(result.exitCode).toBe(0);
+    const root = evidenceAtUpload[0]?.find(item => item.name === 'isolated-task');
+    expect(root?.parentSpanId).toBeUndefined();
+    expect(root?.spanContext().traceId).toBe(uploads[0]?.traceId);
+    if (nested) expect(root?.spanContext().traceId).not.toBe(outerId);
+    expect(root?.attributes).toMatchObject({ 'neatlogs.replay.run_id': runId, 'neatlogs.replay.case_id': caseId, 'neatlogs.replay.trial': 1, 'test.mask.complete': true });
+    expect(evidenceAtUpload[0]?.some(item => item.name === 'lookup')).toBe(true);
+    expect(evidenceAtUpload[0]?.some(item => item.attributes['neatlogs.trace.complete'] === true)).toBe(true);
+  });
+
+  it.each([false, true])('seals oversized outputs and resumes current/legacy delivery without repeating tasks, legacy=%s', async legacy => {
+    const task = vi.fn().mockImplementationOnce(() => 'x'.repeat(70 * 1024)).mockReturnValue('answer');
+    const options = { grading, trials: 2, dataset: datasetId!, label: 'oversized', statePath: join(directory, 'oversized.json'), api: { projectId: projectId!, token: 'task-token', baseUrl }, task };
+    failUpload = true;
+    await expect(runEval(options)).rejects.toThrow(/HTTP 503/);
+    const saved = JSON.parse(readFileSync(options.statePath, 'utf8'));
+    expect(saved.slots[`${caseId}:1`].body).toMatchObject({ error: { code: 'OUTPUT_TOO_LARGE' } });
+    expect(saved.slots[`${caseId}:1`].body).not.toHaveProperty('output');
+    if (legacy) {
+      saved.slots[`${caseId}:1`].body = { caseId, trial: 1, output: 'x'.repeat(70 * 1024) };
+      writeFileSync(options.statePath, JSON.stringify(saved));
+    }
+    failUpload = false;
+    const result = await runEval({ ...options, resume: true });
+    expect(task).toHaveBeenCalledTimes(2);
+    expect(result.exitCode).toBe(4);
+    expect(uploads[0]).toMatchObject({ error: { code: 'OUTPUT_TOO_LARGE' } });
+    expect(uploads[1]).toMatchObject({ trial: 2, output: 'answer' });
+    expect(completionKeys).toHaveLength(1);
+  });
+
+  it.each(['ascii', 'emoji', 'nonfinite'])('saves an uploadable failure for invalid %s metrics and resumes without re-executing', async defect => {
+    const task = vi.fn((_input, context) => { context.metrics[defect === 'emoji' ? '😀'.repeat(51) : defect === 'ascii' ? 'x'.repeat(101) : 'score'] = defect === 'nonfinite' ? NaN : 1; return 'answer'; });
+    const options = { grading, dataset: datasetId!, label: 'invalid metrics', statePath: join(directory, 'metrics.json'), api: { projectId: projectId!, token: 'task-token', baseUrl }, task };
+    failUpload = true;
+    await expect(runEval(options)).rejects.toThrow(/HTTP 503/);
+    const saved = JSON.parse(readFileSync(options.statePath, 'utf8'));
+    expect(saved.slots[`${caseId}:1`].body).toMatchObject({ error: { code: 'INVALID_TASK_OUTPUT' } });
+    expect(saved.slots[`${caseId}:1`].body).not.toHaveProperty('output');
+    failUpload = false;
+    expect((await runEval({ ...options, resume: true })).exitCode).toBe(4);
+    expect(task).toHaveBeenCalledOnce();
+    expect(uploads).toHaveLength(1);
+    expect(uploads[0]).toMatchObject({ error: { code: 'INVALID_TASK_OUTPUT' } });
+    expect(completionKeys).toHaveLength(1);
+  });
+
+  it('saves private state atomically without following a pre-existing fixed temporary symlink', async () => {
+    const statePath = join(directory, 'private.json'), victim = join(directory, 'victim');
+    writeFileSync(victim, 'unchanged', { mode: 0o644 });
+    symlinkSync(victim, statePath + '.tmp');
+    const result = await runEval({ grading, dataset: datasetId!, label: 'private state', statePath, api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' });
+    expect(result.exitCode).toBe(0);
+    expect(readFileSync(victim, 'utf8')).toBe('unchanged');
+    expect(statSync(victim).mode & 0o777).toBe(0o644);
+    expect(lstatSync(statePath).isFile()).toBe(true);
+    expect(statSync(statePath).mode & 0o077).toBe(0);
+    expect(JSON.parse(readFileSync(statePath, 'utf8')).slots[`${caseId}:1`].accepted).toBe(true);
+  });
+
   it('resumes uncertain run completion with its original idempotency key', async () => {
     const options = { grading, dataset: datasetId!, label: 'resume completion', statePath: join(directory, 'completion.json'), api: { projectId: projectId!, token: 'task-token', baseUrl }, task: () => 'answer' };
     failCompletionCount = 2;

@@ -129,6 +129,7 @@ export class DatasetApi {
       const headers = {
         Authorization: `Bearer ${this.token}`,
         'x-project-id': this.projectId,
+        ...(method === 'GET' && path.split('?')[0] === '/datasets' ? { Prefer: 'pagination=cursor' } : {}),
         ...(serialized !== undefined ? { 'Content-Type': 'application/json' } : {}),
         ...(idempotencyKey ? { 'Idempotency-Key': uuid(idempotencyKey, 'Idempotency-Key') } : {}),
       };

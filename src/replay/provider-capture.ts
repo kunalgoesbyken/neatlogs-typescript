@@ -3,7 +3,7 @@ import type { Span } from '@opentelemetry/api';
 import { z } from 'zod';
 import { mediaReferences, sanitizeMediaPayload } from '../core/media.js';
 import type { DatasetJson } from '../dataset/api.js';
-import { isCompleteProviderResponse, replayProviderOperationSchema, type ReplayProviderOperation } from './provider.js';
+import { isCompleteProviderResponse, providerData, replayProviderOperationSchema, type ReplayProviderOperation } from './provider.js';
 
 export const MODEL_CAPTURE_ATTRIBUTE = 'neatlogs.replay.model_capture';
 const MAX_BYTES = 1024 * 1024;
@@ -14,54 +14,6 @@ const recording = z.object({
   output: z.json(),
   digest: z.string().regex(/^[a-f0-9]{64}$/),
 }).strict();
-const transportKeys = /^(?:api_?key|authorization|proxyAuthorization|headers|extraHeaders|httpOptions|abortSignal|credentials|access_token|client_secret)$/i;
-
-/** Copy actual data properties, never SDK getters, toJSON hooks, or reconstructed messages. */
-function providerData(value: unknown, response = false): DatasetJson {
-  let bytes = 0;
-  let nodes = 0;
-  const ancestors = new Set<object>();
-  const visit = (item: unknown, depth: number): DatasetJson => {
-    if (++nodes > 4096 || depth > 32) throw new Error('Provider capture exceeds traversal limit.');
-    if (typeof item === 'string') {
-      bytes += Buffer.byteLength(item);
-      if (bytes > MAX_BYTES) throw new Error('Provider capture exceeds size limit.');
-      return item;
-    }
-    if (item === null || typeof item === 'boolean' || typeof item === 'number' && Number.isFinite(item)) return item;
-    if (typeof item !== 'object' || item === null || ancestors.has(item)) throw new Error('Provider capture is not JSON.');
-    if ((!response || depth > 0) && !Array.isArray(item) && Object.getPrototypeOf(item) !== Object.prototype && Object.getPrototypeOf(item) !== null) throw new Error('SDK object is not JSON.');
-    ancestors.add(item);
-    try {
-      if (Array.isArray(item)) {
-        if (item.length > 4096 || Reflect.ownKeys(item).length !== item.length + 1) throw new Error('Array is not plain JSON.');
-        const values: DatasetJson[] = [];
-        for (let index = 0; index < item.length; index++) {
-          const property = Object.getOwnPropertyDescriptor(item, String(index));
-          if (!property || !('value' in property) || !property.enumerable) throw new Error('Array is not plain JSON.');
-          values.push(visit(property.value, depth + 1));
-        }
-        return values;
-      }
-      const entries: Array<[string, DatasetJson]> = [];
-      for (const key of Reflect.ownKeys(item)) {
-        if (typeof key !== 'string') throw new Error('Symbol data cannot be captured.');
-        if (response && depth === 0 && ['sdkHttpResponse', '_request_id'].includes(key)) continue;
-        if (transportKeys.test(key) || ['__proto__', 'prototype', 'constructor'].includes(key)) throw new Error('Transport data cannot be captured.');
-        const descriptor = Object.getOwnPropertyDescriptor(item, key);
-        if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) throw new Error('Hidden or computed data cannot be captured.');
-        if (descriptor.value === undefined) continue;
-        bytes += Buffer.byteLength(key);
-        if (bytes > MAX_BYTES) throw new Error('Provider capture exceeds size limit.');
-        entries.push([key, visit(descriptor.value, depth + 1)]);
-      }
-      return Object.fromEntries(entries);
-    } finally {
-      ancestors.delete(item);
-    }
-  };
-  return visit(value, 0);
-}
 
 function safeBody(value: unknown, response = false): DatasetJson {
   const body = providerData(value, response);

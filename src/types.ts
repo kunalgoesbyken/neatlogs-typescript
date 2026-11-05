@@ -62,8 +62,6 @@ export interface PromptMessage {
 export interface InitOptions {
   /** Neatlogs API key. Falls back to NEATLOGS_API_KEY env var. */
   apiKey?: string;
-  /** Fetch these A/B test settings at init and refresh in the background every 60 seconds. */
-  experiments?: { keys: string[]; baseUrl?: string };
   /** Name of the workflow being traced. Defaults to process.argv[1]. */
   workflowName?: string;
   /**

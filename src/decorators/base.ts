@@ -61,37 +61,52 @@ export function safeJsonDumps(value: any): string {
  * recursing until the stack overflows, so tracing a request, an ORM entity or
  * any self-referencing value can never throw into the caller's code.
  */
-export function serializeObj(obj: any): any {
-  return serializeInner(obj, new WeakSet());
+export function serializeObj(obj: any, markLossy?: () => void): any {
+  return serializeInner(obj, new WeakSet(), markLossy);
 }
 
-function serializeInner(obj: any, ancestors: WeakSet<object>): any {
+function serializeInner(obj: any, ancestors: WeakSet<object>, markLossy?: () => void): any {
+  if (obj === undefined) markLossy?.();
   if (obj === null || obj === undefined) return obj;
   // Preserve binary views until media capture can classify and sanitize them.
   // JSON.stringify retains the previous numeric-object representation for
   // ordinary, non-media Uint8Array values.
-  if (obj instanceof Uint8Array) return obj;
+  if (obj instanceof Uint8Array) { markLossy?.(); return obj; }
   if (
     typeof obj === "string" ||
     typeof obj === "number" ||
     typeof obj === "boolean"
-  )
+  ) {
+    if (typeof obj === "number" && !Number.isFinite(obj)) markLossy?.();
     return obj;
-  if (typeof obj.toJSON === "function") return obj.toJSON();
+  }
+  if (typeof obj.toJSON === "function") { markLossy?.(); return obj.toJSON(); }
   if (typeof obj === "object") {
-    if (ancestors.has(obj)) return "[Circular]";
+    if (ancestors.has(obj)) { markLossy?.(); return "[Circular]"; }
     ancestors.add(obj);
     try {
-      if (Array.isArray(obj)) return obj.map((item) => serializeInner(item, ancestors));
+      if (Array.isArray(obj)) {
+        if (markLossy) {
+          if (Reflect.ownKeys(obj).length !== obj.length + 1) markLossy();
+          for (let index = 0; index < obj.length; index++) {
+            const property = Object.getOwnPropertyDescriptor(obj, String(index));
+            if (!property || !('value' in property) || !property.enumerable) { markLossy(); break; }
+          }
+        }
+        return obj.map((item) => serializeInner(item, ancestors, markLossy));
+      }
+      if (markLossy && (Object.getPrototypeOf(obj) !== Object.prototype && Object.getPrototypeOf(obj) !== null || Reflect.ownKeys(obj).length !== Object.keys(obj).length)) markLossy();
       const result: Record<string, any> = {};
       for (const [key, value] of Object.entries(obj)) {
-        result[key] = serializeInner(value, ancestors);
+        if (markLossy && !('value' in Object.getOwnPropertyDescriptor(obj, key)!)) markLossy();
+        result[key] = serializeInner(value, ancestors, markLossy);
       }
       return result;
     } finally {
       ancestors.delete(obj);
     }
   }
+  markLossy?.();
   return String(obj);
 }
 
@@ -226,7 +241,7 @@ export function decorateSpan<TArgs extends any[], TReturn>(
       const captureResult = (result: any): void => {
         if (captureOutput) {
           try {
-            const serialized = serializeObj(result);
+            const serialized = serializeObj(result, opts.kind === 'TOOL' || opts.kind === 'MCP_TOOL' ? () => span.setAttribute('neatlogs.capture_fidelity', 'unavailable') : undefined);
             const captured = captureMedia(
               span,
               mediaPrefix("output"),
@@ -619,6 +634,7 @@ export function decorateSpan<TArgs extends any[], TReturn>(
       try {
         // Set common attributes
         setCommonSpanAttrs(span, opts);
+        if (opts.kind === 'TOOL' || opts.kind === 'MCP_TOOL') span.setAttribute('tool.name', opts.toolName ?? spanName);
 
         // Session/end-user identity (root span only; skipped on a non-root child).
         const spanIsRoot = isRoot && !autoRoot.root;
@@ -637,10 +653,8 @@ export function decorateSpan<TArgs extends any[], TReturn>(
         // Capture input
         if (captureInput && args.length > 0) {
           try {
-            const inputValue =
-              args.length === 1
-                ? serializeObj(args[0])
-                : args.map(serializeObj);
+            const markLossy = opts.kind === 'TOOL' || opts.kind === 'MCP_TOOL' ? () => span.setAttribute('neatlogs.capture_fidelity', 'unavailable') : undefined;
+            const inputValue = args.length === 1 ? serializeObj(args[0], markLossy) : args.map(value => serializeObj(value, markLossy));
             span.setAttribute(
               "input.value",
               safeJsonDumps(

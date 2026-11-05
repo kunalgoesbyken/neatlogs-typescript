@@ -13,6 +13,7 @@
  * Also exports traceTool() to wrap user-defined tool functions with TOOL spans.
  */
 
+import { AsyncResource } from 'node:async_hooks';
 import { SpanStatusCode, type Span } from "@opentelemetry/api";
 import { observeRawResponse } from "./core/raw-response.js";
 import { getProviderTracer } from "./core/auto-root.js";
@@ -24,7 +25,7 @@ import {
   wrapResponsesAsyncIterableStream,
 } from "./core/openai-responses.js";
 import { recordFailure } from "./core/span-outcome.js";
-import { cachedModelSpan, providerReplay } from './replay/provider.js';
+import { cachedModelSpan, prepareProviderReplay } from './replay/provider.js';
 import { prepareProviderCapture } from './replay/provider-capture.js';
 import {
   getNeatlogsTracer,
@@ -232,12 +233,16 @@ function tracedChatCompletionsCreate(original: (...args: any[]) => any) {
     const captureResponse = prepareProviderCapture(span, 'openai.chat.completions.create', opts, !isStream && rest.length === 0);
     let result: any;
     let replayed = false;
+    let resolveReplay: ((raw: boolean) => any) | undefined;
     try {
-      result = withNeatlogsSpan(span, () => {
-        const saved = providerReplay('openai.chat.completions.create', opts, !isStream && rest.length === 0);
+      const consumeReplay = withNeatlogsSpan(span, () => prepareProviderReplay('openai.chat.completions.create', opts, !isStream && rest.length === 0));
+      const execute = (raw = false) => withNeatlogsSpan(span, () => {
+        const saved = consumeReplay?.consume(!raw);
         replayed = saved !== undefined;
         return replayed ? saved : original(opts, ...rest);
       });
+      resolveReplay = consumeReplay?.canRestore ? AsyncResource.bind(execute) : undefined;
+      if (!resolveReplay) result = execute();
     } catch (err) {
       recordError(span, err);
       throw err;
@@ -253,6 +258,7 @@ function tracedChatCompletionsCreate(original: (...args: any[]) => any) {
         return response;
       },
       isStream,
+      resolveReplay,
     );
   };
 }
@@ -263,49 +269,55 @@ function tracedChatCompletionsCreate(original: (...args: any[]) => any) {
 
 
 // Preserve the SDK's response helpers while sharing one traced parsed result.
-function preserveResponseHelpers(result: any, span: Span, finalize: (value: any) => any, isStream = false): any {
-  const target = result && typeof result.then === "function" ? result : Promise.resolve(result);
+function preserveResponseHelpers(result: any, span: Span, finalize: (value: any) => any, isStream = false, resolveReplay?: (raw: boolean) => any): any {
+  let target = resolveReplay ? undefined : result && typeof result.then === 'function' ? result : Promise.resolve(result);
   let traced: Promise<any> | undefined;
-  const consume = () => traced ??= Promise.resolve(target).then(finalize, (err: any) => {
+  const resolve = (raw = false) => {
+    if (!target) {
+      try {
+        const value = resolveReplay!(raw);
+        target = value && typeof value.then === 'function' ? value : Promise.resolve(value);
+      } catch (error) { recordError(span, error); throw error; }
+    } else if (raw && resolveReplay && typeof target.asResponse !== 'function') {
+      throw new Error('Request raw-response helpers before consuming a replayed response; HTTP metadata was not recorded.');
+    }
+    return target;
+  };
+  const consume = () => traced ??= Promise.resolve().then(() => resolve()).then(finalize, (err: any) => {
     recordError(span, err);
     throw err;
   });
-  return new Proxy(target, {
-    get(promise, prop) {
-      if (prop === "then" || prop === "catch" || prop === "finally") {
-        return (...args: any[]) => (consume() as any)[prop](...args);
-      }
-      if (prop === "withResponse" && typeof promise.withResponse === "function") {
+  return new Proxy(result ?? Promise.resolve(), {
+    get(_promise, prop) {
+      if (prop === 'then' || prop === 'catch' || prop === 'finally') return (...args: any[]) => (consume() as any)[prop](...args);
+      if (prop === 'withResponse' && (resolveReplay || typeof target.withResponse === 'function')) {
         return async () => {
+          const promise = resolve(true);
+          if (typeof promise.asResponse !== 'function') throw new Error('The provider does not expose HTTP response helpers.');
           const [data, response] = await Promise.all([consume(), promise.asResponse()]);
-          return { data, response, request_id: response.headers.get("x-request-id") };
+          return { data, response, request_id: response.headers.get('x-request-id') };
         };
       }
-      if (prop === "asResponse" && typeof promise.asResponse === "function") {
+      if (prop === 'asResponse' && (resolveReplay || typeof target.asResponse === 'function')) {
         return async () => {
           try {
+            const promise = resolve(true);
+            if (typeof promise.asResponse !== 'function') throw new Error('The provider does not expose HTTP response helpers.');
             const response = await promise.asResponse();
             if (!traced && span.isRecording()) {
-              if (response.ok) {
-                observeRawResponse(response, span, {
-                  isStream,
-                  isTraced: () => traced !== undefined,
-                  finalize,
-                });
-              } else {
-                span.setStatus({ code: SpanStatusCode.ERROR });
-                span.end();
-              }
+              if (response.ok) observeRawResponse(response, span, { isStream, isTraced: () => traced !== undefined, finalize });
+              else { span.setStatus({ code: SpanStatusCode.ERROR }); span.end(); }
             }
             return response;
           } catch (err) {
-            recordError(span, err);
+            if (!traced) recordError(span, err);
             throw err;
           }
         };
       }
+      const promise = resolve();
       const value = Reflect.get(promise, prop, promise);
-      return typeof value === "function" ? value.bind(promise) : value;
+      return typeof value === 'function' ? value.bind(promise) : value;
     },
   });
 }
@@ -343,12 +355,16 @@ function tracedResponsesCreate(original: (...args: any[]) => any) {
     const captureResponse = prepareProviderCapture(span, 'openai.responses.create', opts, !isStream && rest.length === 0);
     let result: any;
     let replayed = false;
+    let resolveReplay: ((raw: boolean) => any) | undefined;
     try {
-      result = withNeatlogsSpan(span, () => {
-        const saved = providerReplay('openai.responses.create', opts, !isStream && rest.length === 0);
+      const consumeReplay = withNeatlogsSpan(span, () => prepareProviderReplay('openai.responses.create', opts, !isStream && rest.length === 0));
+      const execute = (raw = false) => withNeatlogsSpan(span, () => {
+        const saved = consumeReplay?.consume(!raw);
         replayed = saved !== undefined;
         return replayed ? saved : original(opts, ...rest);
       });
+      resolveReplay = consumeReplay?.canRestore ? AsyncResource.bind(execute) : undefined;
+      if (!resolveReplay) result = execute();
     } catch (err) {
       recordError(span, err);
       throw err;
@@ -364,6 +380,7 @@ function tracedResponsesCreate(original: (...args: any[]) => any) {
         return response;
       },
       isStream,
+      resolveReplay,
     );
   };
 }

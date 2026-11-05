@@ -10,7 +10,7 @@ export const allReplayConfigurationSchema = z.object({
   projectId: z.string().uuid(), datasetId: z.string().uuid(), versionId: z.string().uuid(), baseUrl: z.string().url(),
   cwd: z.string().min(1), agentFile: z.string().min(1), agentDigest: z.string().regex(/^[a-f0-9]{64}$/),
   label: z.string().min(1).max(120), trials: z.number().int().min(1).max(10), batchSize: z.number().int().min(1).max(100),
-  deadlineSeconds: z.number().int().min(60).max(3600), replay: replaySettingsSchema,
+  deadlineSeconds: z.number().int().min(60).max(3600), replay: replaySettingsSchema.refine((value): boolean => value.mode === 'tools_only', { message: 'Whole-dataset replay supports tools_only; checkpoint IDs belong to individual recordings.' }),
   params: z.record(z.string().min(1).max(100), z.union([z.string().max(2000), z.number().finite(), z.boolean(), z.null()])).refine(value => Object.keys(value).length <= 20),
   grading: z.object({ formVersionId: z.string().uuid(), evaluatorIds: z.array(z.string().uuid()).min(1).max(20) }).strict().nullable(),
 }).strict();

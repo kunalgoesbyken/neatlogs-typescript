@@ -16,6 +16,7 @@ const usage = `Usage: neatlogs simulate local --recording <file> [--until-span <
    or: neatlogs simulate local --resume <file> [--json]
 Add --upload --form <id> --evaluator <id> to save a graded run. Repeat --evaluator for more graders.
 --trials 1..10, --agent <path>, --label <name>, --param name=value and --mode tools_only|until_span are optional.
+--all supports tools_only; checkpoint span IDs are per recording, so use individual cases with --until-span.
 The local command comes from .neatlogs/agent.yaml. Tools use saved results; models stay live.
 On the first missing match, subsequent calls run live, including tools.
 Dataset/API access uses NEATLOGS_TOKEN and NEATLOGS_PROJECT_ID. The agent must separately export its trace and call shutdown().`;
@@ -74,6 +75,7 @@ export async function runSimulateCli(argv: string[]): Promise<number> {
     const mode = values.mode ?? (values['until-span'] ? 'until_span' : 'tools_only');
     if (mode !== 'tools_only' && mode !== 'until_span' || mode === 'until_span' && !values['until-span'] || mode === 'tools_only' && values['until-span'])
       throw new Error('Use tools_only, or supply --until-span for checkpoint replay.');
+    if (values.all && mode === 'until_span') throw new Error('--all does not support --until-span: checkpoints belong to individual recordings. Select each case separately.');
     const replay = replaySettingsSchema.parse({ mode, ...(values['until-span'] ? { untilSpan: values['until-span'] } : {}) });
     const trials = numberOption(values.trials!, 'trials', 1, 10), deadlineSeconds = numberOption(values['deadline-seconds']!, 'deadline-seconds', 60, 3600);
     const params = parameters(values.param ?? []), config = parseAgentConfig(await boundedFile(resolve(values.agent!), 64 * 1024));

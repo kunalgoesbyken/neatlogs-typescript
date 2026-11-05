@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { DatasetApi, DatasetCaptureError, json, serializeCaptureBody, type DatasetApiOptions, type DatasetJson } from './dataset/api.js';
 import { withAllReplayLock } from './replay/all-state.js';
 import { taskCredentialRefresh } from './task-credentials.js';
-import { LocalRunApi } from './replay/run-api.js';
+import { LocalRunApi, LocalRunApiError } from './replay/run-api.js';
 import { trace } from './core/context.js';
 import { getNeatlogsProvider, runWithFreshNeatlogsContext } from './core/provider.js';
 import { assertCaptureProvider } from './dataset/capture-scope.js';
@@ -44,7 +44,8 @@ export interface RunEvalOptions {
   caseIds?: string[];
 }
 export interface EvalResult { runId: string; comparison: Awaited<ReturnType<LocalRunApi['comparison']>>; gate: Awaited<ReturnType<LocalRunApi['gate']>> | null; errors: number; exitCode: 0 | 1 | 4 }
-const slotSchema = z.object({ key: z.string().uuid(), executing: z.boolean(), accepted: z.boolean().optional(), body: z.object({ caseId: z.string().uuid(), trial: z.number().int(), traceId: z.string().regex(/^[a-f0-9]{32}$/).optional(), output: z.json().optional(), metrics: z.record(z.string(), z.number()).optional(), error: z.object({ code: z.string(), message: z.string() }).optional() }).strict().optional() }).strict();
+const slotSchema = z.object({ key: z.string().uuid(), executing: z.boolean(), accepted: z.boolean().optional(), body: z.object({ caseId: z.string().uuid(), trial: z.number().int(), traceId: z.string().regex(/^[a-f0-9]{32}$/).optional(), output: z.json().optional(), metrics: z.record(z.string(), z.number()).optional(), error: z.object({ code: z.string(), message: z.string() }).optional() }).strict().optional(),
+  rejection: z.object({ key: z.string().uuid(), error: z.object({ code: z.literal('GRADING_EVIDENCE_LIMIT'), message: z.string().max(1000) }).strict() }).strict().optional() }).strict();
 const dispatchSlotSchema = z.object({ batchId: z.string().uuid(), key: z.string().uuid(), accepted: z.boolean() }).strict();
 const stateSchema = z.object({ projectId: z.string().uuid(), request: z.record(z.string(), z.json()), taskDigest: z.string().regex(/^[a-f0-9]{64}$/), registrationKey: z.string().uuid(), runId: z.string().uuid().nullable(), traceEvidence: z.boolean().optional(), slots: z.record(z.string(), slotSchema),
   completionKey: z.string().uuid().optional(), gateKey: z.string().uuid().optional(), gradingDispatch: z.object({ evaluationId: z.string().uuid(), recorded: dispatchSlotSchema, candidate: dispatchSlotSchema }).strict().optional() }).strict();
@@ -179,13 +180,23 @@ async function runEvalLocked(options: RunEvalOptions): Promise<EvalResult> {
     if (slot.body.traceId) {
       if (!flushTrace || !await flushTrace()) throw new Error('Could not export the task trace. Resume after checking the SDK connection.');
       await runApi.upload(runId, { caseId: slot.body.caseId, trial: slot.body.trial, traceId: slot.body.traceId }, { key: slot.key, waitMillis: 300_000 });
-    } else await runApi.taskOutput(runId, slot.body, slot.key);
+    } else {
+      const output = slot;
+      const deliver = () => runApi.taskOutput(runId, output.rejection ? { caseId: body.caseId, trial: body.trial, error: output.rejection.error } : body, output.rejection?.key ?? output.key);
+      try { await deliver(); }
+      catch (error) {
+        if (output.rejection || !('output' in body) || !(error instanceof LocalRunApiError) || error.status !== 413 || error.code !== 'GRADING_EVIDENCE_LIMIT') throw error;
+        output.rejection = { key: randomUUID(), error: { code: 'GRADING_EVIDENCE_LIMIT', message: 'The answer exceeds the combined grading evidence limit. No output was truncated or task rerun. Use a smaller case for a new run.' } };
+        save(options.statePath, state);
+        await deliver();
+      }
+    }
     slot.accepted = true; save(options.statePath, state);
   }
   state.completionKey ??= randomUUID();
   save(options.statePath, state);
   let status = await runApi.complete(runId, state.completionKey);
-  const errors = Object.values(state.slots).filter(slot => slot.body?.error).length;
+  const errors = Object.values(state.slots).filter(slot => slot.rejection || slot.body?.error).length;
   const deadline = Date.now() + timeout;
   while (options.grading && status.state === 'completed' &&
     (status.gradingHandoffState === 'pending' || status.gradingHandoffState === 'ready') && Date.now() < deadline) {

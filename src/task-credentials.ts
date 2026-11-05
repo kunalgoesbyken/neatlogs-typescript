@@ -18,7 +18,7 @@ export function taskCredentialRefresh(options: { token: string; projectId: strin
     if (token !== rejected) return token;
     pending ??= (async () => {
       try {
-        const response = await context.with(suppressTracing(context.active()), () => fetch(url, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(5_000),
+        const response = await context.with(suppressTracing(context.active()), () => fetch(url, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(30_000),
           headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ rejectedToken: rejected }) }));
         const reader = response.body?.getReader();
         if (!response.ok || !reader) { await response.body?.cancel(); throw new Error(); }

@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { createServer, type Server, type RequestListener } from 'node:http';
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
@@ -10,6 +10,7 @@ import { runSimulateCli } from '../../src/simulate-cli.js';
 import { DatasetApi } from '../../src/dataset/api.js';
 import { enumerateSavedDataset, datasetSelectionDigest } from '../../src/replay/all-selection.js';
 import { agentConfigDigest, createAllReplayState, readAllReplayState, saveAllReplayState, withAllReplayLock, type AllReplayConfiguration } from '../../src/replay/all-state.js';
+import { continueWholeDataset } from '../../src/replay/all-command.js';
 
 const exec = promisify(execFile), servers: Server[] = [], directories: string[] = [];
 const ids = { project: randomUUID(), dataset: randomUUID(), version: randomUUID(), form: randomUUID(), evaluator: randomUUID() };
@@ -83,6 +84,49 @@ describe('entire saved dataset replay', () => {
     state.cases[0]!.revisionId = randomUUID();
     await saveAllReplayState(path, state);
     await expect(readAllReplayState(path)).rejects.toThrow('changed');
+  });
+
+  it('resumes a legacy single-recording checkpoint upload without executing the agent again', async () => {
+    const directory = await workspace(), path = join(directory, 'legacy.json'), agentFile = join(directory, 'agent.json');
+    const apiCalls: string[] = [], uploadKey = randomUUID(), runId = randomUUID(), traceId = 'a'.repeat(32);
+    const baseUrl = await serve(async (request, response) => {
+      apiCalls.push(request.url!);
+      expect(request.method).toBe('POST');
+      expect(request.url).toBe(`/api/v1/public/runs/${runId}/outputs`);
+      expect(request.headers['idempotency-key']).toBe(uploadKey);
+      send(response, { runId, itemId: randomUUID(), outputId: randomUUID(), traceId, state: 'succeeded' });
+    });
+    const marker = join(directory, 'agent-executed');
+    const agent = { command: [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(marker)},'unexpected')`], timeout_seconds: 1 };
+    await writeFile(agentFile, JSON.stringify(agent));
+    const configuration: AllReplayConfiguration = { projectId: ids.project, datasetId: ids.dataset, versionId: ids.version, baseUrl, cwd: process.cwd(), agentFile, agentDigest: agentConfigDigest(agent), label: 'legacy checkpoint', trials: 1, batchSize: 1, deadlineSeconds: 900, replay: { mode: 'tools_only' }, params: {}, grading: { formVersionId: ids.form, evaluatorIds: [ids.evaluator] } };
+    const state = createAllReplayState(configuration, members(1));
+    state.configuration.replay = { mode: 'until_span', untilSpan: 'checkpoint' };
+    state.configurationDigest = createHash('sha256').update(JSON.stringify(state.configuration)).digest('hex');
+    const batch = state.batches[0]!, slot = batch.slots[0]!;
+    batch.run = { runId, state: 'running', deadlineAt: new Date(Date.now() + 900_000).toISOString(), itemCount: 1 };
+    slot.uploadKey = uploadKey;
+    slot.progress = { kind: 'upload_pending', traceId };
+    slot.execution = { sourceTraceId: 'original-recording', runId, exitCode: 0, status: { sourceTraceId: 'original-recording', mode: 'until_span', hits: 1, liveCalls: 1, switchedToLive: true, reason: 'checkpoint', firstMiss: null, traceIds: [traceId] } };
+    await saveAllReplayState(path, state);
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    try {
+      expect(await continueWholeDataset({ path, apiOptions: options(baseUrl), json: true })).toBe(0);
+      expect((await readAllReplayState(path)).batches[0]!.slots[0]!.progress.kind).toBe('accepted');
+      expect(apiCalls).toEqual([`/api/v1/public/runs/${runId}/outputs`]);
+      await expect(readFile(marker)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally { stdout.mockRestore(); }
+  });
+
+  it.each(['pending', 'executing', 'cross-recording'] as const)('rejects unsafe legacy checkpoint state: %s', async defect => {
+    const directory = await workspace(), path = join(directory, 'unsafe-legacy.json');
+    const configuration: AllReplayConfiguration = { projectId: ids.project, datasetId: ids.dataset, versionId: ids.version, baseUrl: 'http://127.0.0.1:1', cwd: process.cwd(), agentFile: '/never-read.json', agentDigest: 'a'.repeat(64), label: 'legacy checkpoint', trials: 1, batchSize: 1, deadlineSeconds: 900, replay: { mode: 'tools_only' }, params: {}, grading: null };
+    const state = createAllReplayState(configuration, members(defect === 'cross-recording' ? 2 : 1));
+    state.configuration.replay = { mode: 'until_span', untilSpan: 'checkpoint' };
+    state.configurationDigest = createHash('sha256').update(JSON.stringify(state.configuration)).digest('hex');
+    if (defect === 'executing') state.batches[0]!.slots[0]!.progress = { kind: 'executing' };
+    await saveAllReplayState(path, state);
+    await expect(readAllReplayState(path)).rejects.toThrow(/Legacy checkpoint recovery/);
   });
 
   it('runs real child processes in bounded batches and resumes upload without repeating a completed command', async () => {

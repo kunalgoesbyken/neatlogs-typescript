@@ -6,14 +6,15 @@ import { replaySettingsSchema, replayStatusSchema } from './contracts.js';
 import { agentConfigSchema } from './local-command.js';
 import { ALL_REPLAY_MAX_CASES, datasetSelectionDigest, selectedCaseSchema, type SelectedCase } from './all-selection.js';
 
-export const allReplayConfigurationSchema = z.object({
+const savedConfigurationSchema = z.object({
   projectId: z.string().uuid(), datasetId: z.string().uuid(), versionId: z.string().uuid(), baseUrl: z.string().url(),
   cwd: z.string().min(1), agentFile: z.string().min(1), agentDigest: z.string().regex(/^[a-f0-9]{64}$/),
   label: z.string().min(1).max(120), trials: z.number().int().min(1).max(10), batchSize: z.number().int().min(1).max(100),
-  deadlineSeconds: z.number().int().min(60).max(3600), replay: replaySettingsSchema.refine((value): boolean => value.mode === 'tools_only', { message: 'Whole-dataset replay supports tools_only; checkpoint IDs belong to individual recordings.' }),
+  deadlineSeconds: z.number().int().min(60).max(3600), replay: replaySettingsSchema,
   params: z.record(z.string().min(1).max(100), z.union([z.string().max(2000), z.number().finite(), z.boolean(), z.null()])).refine(value => Object.keys(value).length <= 20),
   grading: z.object({ formVersionId: z.string().uuid(), evaluatorIds: z.array(z.string().uuid()).min(1).max(20) }).strict().nullable(),
 }).strict();
+export const allReplayConfigurationSchema = savedConfigurationSchema.refine(value => value.replay.mode === 'tools_only', { message: 'Whole-dataset replay supports tools_only; checkpoint IDs belong to individual recordings.' });
 const progressSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('pending') }).strict(),
   z.object({ kind: z.literal('executing') }).strict(),
@@ -30,7 +31,7 @@ const slotSchema = z.object({ caseId: z.string().uuid(), trial: z.number().int()
 const runSchema = z.object({ runId: z.string().uuid(), state: z.string(), deadlineAt: z.string().datetime(), itemCount: z.number().int().nonnegative() }).strict();
 const batchSchema = z.object({ offset: z.number().int().nonnegative(), registrationKey: z.string().uuid(), run: runSchema.nullable(), slots: z.array(slotSchema).min(1).max(1000) }).strict();
 const stateSchema = z.object({
-  version: z.literal(1), groupId: z.string().uuid(), configuration: allReplayConfigurationSchema,
+  version: z.literal(1), groupId: z.string().uuid(), configuration: savedConfigurationSchema,
   configurationDigest: z.string().regex(/^[a-f0-9]{64}$/), selectionDigest: z.string().regex(/^[a-f0-9]{64}$/),
   cases: z.array(selectedCaseSchema).min(1).max(ALL_REPLAY_MAX_CASES), batches: z.array(batchSchema).min(1).max(ALL_REPLAY_MAX_CASES),
 }).strict();
@@ -38,9 +39,10 @@ export type AllReplayConfiguration = z.infer<typeof allReplayConfigurationSchema
 export type AllReplayState = z.infer<typeof stateSchema>;
 export type AllReplaySlot = z.infer<typeof slotSchema>;
 export const agentConfigDigest = (value: z.infer<typeof agentConfigSchema>) => createHash('sha256').update(JSON.stringify(agentConfigSchema.parse(value))).digest('hex');
-export const configurationDigest = (value: AllReplayConfiguration) => createHash('sha256').update(JSON.stringify(allReplayConfigurationSchema.parse(value))).digest('hex');
+export const configurationDigest = (value: AllReplayConfiguration) => createHash('sha256').update(JSON.stringify(savedConfigurationSchema.parse(value))).digest('hex');
 
 export function createAllReplayState(configuration: AllReplayConfiguration, cases: SelectedCase[]): AllReplayState {
+  configuration = allReplayConfigurationSchema.parse(configuration);
   const batches: AllReplayState['batches'] = [];
   for (let offset = 0; offset < cases.length; offset += configuration.batchSize) batches.push({
     offset, registrationKey: randomUUID(), run: null,
@@ -59,6 +61,10 @@ export async function readAllReplayState(path: string): Promise<AllReplayState> 
   if (configurationDigest(config) !== state.configurationDigest || datasetSelectionDigest({ ...config, cases: state.cases }) !== state.selectionDigest ||
       state.cases.some((item, index) => item.position !== index) || new Set(state.cases.map(item => item.caseId)).size !== state.cases.length ||
       state.batches.length !== Math.ceil(state.cases.length / config.batchSize)) throw new Error('The saved selection or command settings were changed. Start a new state file.');
+  if (config.replay.mode === 'until_span' && (state.cases.length !== 1 ||
+      state.batches.some(batch => batch.slots.some(slot => !['accepted', 'upload_pending', 'local_complete'].includes(slot.progress.kind))) ||
+      new Set(state.batches.flatMap(batch => batch.slots.map(slot => slot.execution?.sourceTraceId))).size !== 1))
+    throw new Error('Legacy checkpoint recovery only supports one recording with completed saved outputs. Inspect pending or uncertain work before starting a new run.');
   for (const [index, batch] of state.batches.entries()) {
     const expected = state.cases.slice(index * config.batchSize, (index + 1) * config.batchSize);
     if (batch.offset !== index * config.batchSize || batch.slots.length !== expected.length * config.trials ||

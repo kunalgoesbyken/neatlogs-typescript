@@ -9,9 +9,10 @@ const projectId = randomUUID(), runId = randomUUID(), caseId = randomUUID();
 const newToken = `nloa_${'n'.repeat(43)}`;
 let server: Server, baseUrl: string, renewals: number, status: number;
 let delaySecondRejection = false;
+let refreshDelay = 15;
 let calls: Array<{ path: string; key: string | undefined; body: string }>;
 beforeEach(async () => {
-  renewals = 0; status = 200; calls = []; delaySecondRejection = false;
+  renewals = 0; status = 200; calls = []; delaySecondRejection = false; refreshDelay = 15;
   server = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(Buffer.from(chunk));
@@ -20,7 +21,7 @@ beforeEach(async () => {
     if (request.url === '/refresh') {
       expect(request.headers.authorization).toBe('Bearer private-capability');
       renewals++;
-      await new Promise(resolve => setTimeout(resolve, 15));
+      await new Promise(resolve => setTimeout(resolve, refreshDelay));
       response.end(JSON.stringify({ token: newToken }));
       return;
     }
@@ -46,6 +47,12 @@ function options() {
 }
 
 describe('CLI task token renewal', () => {
+  it('waits for a renewal lasting longer than five seconds', async () => {
+    refreshDelay = 6_000;
+    await expect(new DatasetApi(options()).request('GET', '/datasets')).resolves.toEqual({});
+    expect(renewals).toBe(1);
+    expect(calls).toHaveLength(2);
+  }, 10_000);
   it('does not rotate a new token when an older request is rejected late', async () => {
     delaySecondRejection = true;
     const api = new DatasetApi(options());

@@ -33,15 +33,18 @@ let failGateCount = 0;
 let comparisonRows: { key: string }[] = [];
 let exported: ReadableSpan[] = [];
 let evidenceAtUpload: ReadableSpan[][] = [];
+let caseInput = 'hello', rejectEvidence = false, evidenceRejectionCode: string | undefined, failRejectedFailure = false, disconnectUpload = false;
+let uploadKeys: string[] = [];
 const clients: Client[] = [];
 beforeEach(async () => {
+  caseInput = 'hello'; rejectEvidence = false; evidenceRejectionCode = 'GRADING_EVIDENCE_LIMIT'; failRejectedFailure = false; disconnectUpload = false; uploadKeys = [];
   comparisonRows = []; exported = []; evidenceAtUpload = [];
   registrations = []; uploads = []; paths = []; catalogHeaders = []; manyCases = []; datasetPages = []; completionKeys = []; gateKeys = []; comparisonsUntilReady = 0; handoffReady = false; failUpload = false; failCompletionCount = 0; failGateCount = 0; verdict = 'pass'; directory = mkdtempSync(join(tmpdir(), 'neatlogs-eval-'));
   server = createServer(async (request, response) => {
     const path = request.url ?? ''; paths.push(path);
     const chunks = []; for await (const chunk of request) chunks.push(Buffer.from(chunk));
     const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {};
-    let data: unknown, status = 200;
+    let data: unknown, status = 200, code: string | undefined;
     if (request.method === 'GET') {
       if (new URL(path, 'http://localhost').pathname === '/api/v1/public/datasets') {
         catalogHeaders.push(request.headers.prefer);
@@ -59,13 +62,21 @@ beforeEach(async () => {
         data = { state: complete ? 'ready' : 'pending', coverage: { complete }, ...(comparisonRows.length ? { pairs: page, nextCursor: start + page.length < comparisonRows.length ? page.at(-1)?.key : null, questionSummaries: [{ questionId: 'quality', total: comparisonRows.length }] } : {}) };
       }
       else if (path.endsWith(`/runs/${runId}`)) data = { runId, state: 'completed', deadlineAt: '2030-01-01T00:00:00Z', itemCount: 1, completedCount: 1, failedCount: 0, pendingCount: 0, gradingHandoffState: 'dispatched' };
-      else if (path.includes('/cases/') && (path.includes(`/cases/${caseId}`) || manyCases.some(id => path.includes(`/cases/${id}`)))) data = { case: { caseId: path.split('/cases/')[1]!.split('?')[0], revisionId, input: 'hello', expected: { value: 'hello' }, metadata: { language: 'en' } } };
+      else if (path.includes('/cases/') && (path.includes(`/cases/${caseId}`) || manyCases.some(id => path.includes(`/cases/${id}`)))) data = { case: { caseId: path.split('/cases/')[1]!.split('?')[0], revisionId, input: caseInput, expected: { value: 'hello' }, metadata: { language: 'en' } } };
       else if (path.includes('/cases?')) { const offset = Number(new URL(path, 'http://localhost').searchParams.get('offset')); data = manyCases.length ? { cases: manyCases.slice(offset, offset + 100).map(caseId => ({ caseId })), total: manyCases.length } : { cases: [{ caseId }], total: 1 }; }
       else data = { dataset: { caseCount: manyCases.length || 1 }, version: { id: versionId } };
     } else {
       expect(request.headers.authorization).toBe('Bearer task-token'); expect(request.headers['x-project-id']).toBe(projectId); expect(request.headers['idempotency-key']).toBeTruthy();
       if (path.endsWith('/complete')) { completionKeys.push(String(request.headers['idempotency-key'])); if (failCompletionCount > 0) { status = 503; failCompletionCount--; } data = { runId, state: 'completed', deadlineAt: '2030-01-01T00:00:00Z', itemCount: 2, completedCount: 2, failedCount: 0, pendingCount: 0, gradingHandoffState: handoffReady ? 'ready' : 'dispatched' }; }
-      else if (path.endsWith('/outputs')) { if (failUpload) status = 503; else uploads.push(body); data = body.traceId ? { runId, itemId: randomUUID(), outputId: randomUUID(), traceId: body.traceId, state: 'succeeded' } : { outputId: randomUUID(), state: 'succeeded' }; if (body.traceId) evidenceAtUpload.push([...exported]); }
+      else if (path.endsWith('/outputs')) {
+        uploadKeys.push(String(request.headers['idempotency-key']));
+        if (disconnectUpload) { request.socket.destroy(); return; }
+        if (rejectEvidence && 'output' in body) { status = 413; code = evidenceRejectionCode; }
+        else if (failUpload || failRejectedFailure && body.error) status = 503;
+        else uploads.push(body);
+        data = body.traceId ? { runId, itemId: randomUUID(), outputId: randomUUID(), traceId: body.traceId, state: 'succeeded' } : { outputId: randomUUID(), state: body.error ? 'failed' : 'succeeded' };
+        if (body.traceId) evidenceAtUpload.push([...exported]);
+      }
       else if (path.endsWith('/gate')) { gateKeys.push(String(request.headers['idempotency-key'])); if (failGateCount > 0) { status = 503; failGateCount--; } data = { verdict }; }
       else data = { runId, state: path.endsWith('/complete') ? 'completed' : 'queued', deadlineAt: '2030-01-01T00:00:00Z', itemCount: 2, completedCount: 2, failedCount: 0, pendingCount: 0, gradingHandoffState: 'dispatched' };
       if (!path.endsWith('/complete') && !path.endsWith('/gate') && !path.endsWith('/outputs')) {
@@ -73,7 +84,7 @@ beforeEach(async () => {
         const { completedCount: _completed, failedCount: _failed, pendingCount: _pending, gradingHandoffState: _handoff, ...receipt } = data as Record<string, unknown>; data = receipt;
       }
     }
-    response.writeHead(status, { 'Content-Type': 'application/json' }); response.end(JSON.stringify({ success: status < 400, data }));
+    response.writeHead(status, { 'Content-Type': 'application/json' }); response.end(JSON.stringify({ success: status < 400, ...(code ? { code } : {}), data }));
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address(); if (!address || typeof address === 'string') throw new Error('No local test address'); baseUrl = `http://127.0.0.1:${address.port}`;
@@ -208,6 +219,56 @@ describe('task evaluation over the public HTTP contract', () => {
     expect(uploads).toHaveLength(1);
     expect(uploads[0]).toMatchObject({ error: { code: 'INVALID_TASK_OUTPUT' } });
     expect(completionKeys).toHaveLength(1);
+  });
+
+  it('retains computed output and resumes a definite combined-evidence rejection with a new durable failure key', async () => {
+    caseInput = 'x'.repeat(480_000); rejectEvidence = true; failRejectedFailure = true;
+    const output = 'y'.repeat(30_000), task = vi.fn(() => output);
+    const options = { grading, dataset: datasetId!, label: 'combined evidence', statePath: join(directory, 'combined.json'), api: { projectId: projectId!, token: 'task-token', baseUrl }, task };
+    await expect(runEval(options)).rejects.toThrow(/HTTP 503/);
+    const slot = JSON.parse(readFileSync(options.statePath, 'utf8')).slots[`${caseId}:1`];
+    expect(slot.body.output).toBe(output);
+    expect(slot.rejection).toMatchObject({ error: { code: 'GRADING_EVIDENCE_LIMIT' } });
+    expect(slot.rejection.key).not.toBe(slot.key);
+    expect(uploadKeys).toEqual([slot.key, slot.rejection.key, slot.rejection.key]);
+    failRejectedFailure = false;
+    expect((await runEval({ ...options, resume: true })).exitCode).toBe(4);
+    expect(task).toHaveBeenCalledOnce();
+    expect(uploadKeys.at(-1)).toBe(slot.rejection.key);
+    expect(uploads).toHaveLength(1);
+    expect(uploads[0]).toMatchObject({ error: { code: 'GRADING_EVIDENCE_LIMIT' } });
+    expect(uploads[0]).not.toHaveProperty('output');
+    expect(JSON.parse(readFileSync(options.statePath, 'utf8')).slots[`${caseId}:1`].body.output).toBe(output);
+  });
+
+  it('retains the original output and key after an ambiguous connection failure', async () => {
+    disconnectUpload = true;
+    const task = vi.fn(() => 'saved answer');
+    const options = { grading, dataset: datasetId!, label: 'unknown delivery', statePath: join(directory, 'unknown.json'), api: { projectId: projectId!, token: 'task-token', baseUrl }, task };
+    await expect(runEval(options)).rejects.toThrow(/request failed/);
+    const slot = JSON.parse(readFileSync(options.statePath, 'utf8')).slots[`${caseId}:1`];
+    expect(slot.body.output).toBe('saved answer');
+    expect(slot).not.toHaveProperty('rejection');
+    expect(new Set(uploadKeys)).toEqual(new Set([slot.key]));
+    disconnectUpload = false;
+    expect((await runEval({ ...options, resume: true })).exitCode).toBe(0);
+    expect(task).toHaveBeenCalledOnce();
+    expect(new Set(uploadKeys)).toEqual(new Set([slot.key]));
+  });
+
+  it.each([undefined, 'PROXY_BODY_LIMIT'])('does not replace an output after an unrecognized413: %s', async code => {
+    rejectEvidence = true; evidenceRejectionCode = code;
+    const task = vi.fn(() => 'saved answer');
+    const options = { grading, dataset: datasetId!, label: 'unrecognized rejection', statePath: join(directory, 'unrecognized.json'), api: { projectId: projectId!, token: 'task-token', baseUrl }, task };
+    await expect(runEval(options)).rejects.toThrow(/HTTP 413/);
+    const slot = JSON.parse(readFileSync(options.statePath, 'utf8')).slots[`${caseId}:1`];
+    expect(slot.body.output).toBe('saved answer');
+    expect(slot).not.toHaveProperty('rejection');
+    expect(uploadKeys).toEqual([slot.key]);
+    rejectEvidence = false;
+    expect((await runEval({ ...options, resume: true })).exitCode).toBe(0);
+    expect(task).toHaveBeenCalledOnce();
+    expect(uploadKeys).toEqual([slot.key, slot.key]);
   });
 
   it('saves private state atomically without following a pre-existing fixed temporary symlink', async () => {

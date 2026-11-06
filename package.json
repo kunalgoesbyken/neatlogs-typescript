@@ -1,6 +1,6 @@
 {
   "name": "neatlogs",
-  "version": "1.1.28",
+  "version": "1.1.29",
   "description": "AI agent debugging, collaboration, and trace observability. Built for teams using CrewAI, OpenAI, and more.",
   "repository": {
     "type": "git",

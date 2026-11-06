@@ -436,7 +436,7 @@ describe('span() with TOOL edge cases', () => {
     mockSpan = createMockSpan();
   });
 
-  it('should not set tool attributes when not provided', () => {
+  it('uses the resolved function name when toolName is not provided', () => {
     const fn = () => 'tool result';
     const wrapped = span({ kind: 'TOOL' }, fn);
     wrapped();
@@ -444,7 +444,7 @@ describe('span() with TOOL edge cases', () => {
     const toolNameCalls = mockSpan.setAttribute.mock.calls.filter(
       ([key]: [string]) => key === 'tool.name',
     );
-    expect(toolNameCalls).toHaveLength(0);
+    expect(toolNameCalls).toEqual([['tool.name', 'fn']]);
   });
 });
 

@@ -24,6 +24,18 @@ describe('authenticated dataset API transport', () => {
     expect(calls[0].redirect).toBe('error');
   });
 
+  it('negotiates catalog cursors on first and older pages while accepting an unchanged legacy response', async () => {
+    const fetch = vi.fn(async (_url: string, _init: RequestInit) => Response.json({ success: true, data: { datasets: [] } }));
+    vi.stubGlobal('fetch', fetch);
+    const api = new DatasetApi(options);
+    await expect(api.request('GET', '/datasets')).resolves.toEqual({ datasets: [] });
+    await api.request('GET', `/datasets?before=${key}`);
+    await api.request('GET', `/datasets/${key}`);
+    await api.request('POST', '/datasets', { name: 'test' }, key);
+    expect(fetch.mock.calls.map(([, init]) => new Headers(init.headers).get('Prefer'))).toEqual(['pagination=cursor', 'pagination=cursor', null, null]);
+    for (const [, init] of fetch.mock.calls) expect(init.headers).toMatchObject({ Authorization: 'Bearer control-plane-token', 'x-project-id': key });
+  });
+
   it.each(['http://api.example.test', 'https://user:pass@api.example.test', 'https://api.example.test/path', 'https://api.example.test?secret=x'])('rejects unsafe token destination %s', (baseUrl) => {
     expect(() => new DatasetApi({ ...options, baseUrl })).toThrow();
   });

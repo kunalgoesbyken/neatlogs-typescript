@@ -10,6 +10,7 @@
 
 import * as path from "node:path";
 import { createHash } from "node:crypto";
+import { configureReplayFromEnvironment } from './replay/environment.js';
 
 import { Resource } from "@opentelemetry/resources";
 import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
@@ -416,6 +417,7 @@ export function init(options: InitOptions = {}): Promise<void> {
   let identity: InitIdentity;
   try {
     validateInitOptions(options);
+    configureReplayFromEnvironment();
     identity = initIdentity(options);
   } catch (error) {
     return Promise.reject(error);

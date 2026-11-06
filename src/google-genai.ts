@@ -36,6 +36,8 @@ import {
   recordReportedFailure,
 } from './core/span-outcome.js';
 import { captureMedia, captureMediaWithIndex } from './core/media.js';
+import { cachedModelSpan, providerReplay, restoreGoogleResponse } from './replay/provider.js';
+import { prepareProviderCapture } from './replay/provider-capture.js';
 import {
   getNeatlogsTracer,
   getNeatlogsParentContext,
@@ -65,6 +67,7 @@ export function wrapGoogleGenAI<T extends object>(client: T): T {
 export function traceTool<TArgs = any, TResult = any>(
   name: string,
   fn: (args: TArgs) => TResult | Promise<TResult>,
+  options?: { callId?: string },
 ): (args: TArgs) => Promise<TResult> {
   return async function tracedTool(args: TArgs): Promise<TResult> {
     const tracer = getNeatlogsTracer(TRACER_NAME);
@@ -74,6 +77,7 @@ export function traceTool<TArgs = any, TResult = any>(
         attributes: {
           'neatlogs.span.kind': 'TOOL',
           'neatlogs.tool.name': name,
+          ...(options?.callId ? { 'neatlogs.tool.call_id': options.callId } : {}),
         },
       },
       getNeatlogsParentContext(),
@@ -92,6 +96,11 @@ export function traceTool<TArgs = any, TResult = any>(
         span.setStatus({ code: SpanStatusCode.OK });
         return result;
       } catch (err) {
+        const message = err instanceof Error ? err.message : typeof err === 'string' ? err : 'Tool execution failed';
+        span.setAttribute(
+          'output.value',
+          safeStringify(captureMedia(span, 'neatlogs.tool.output', { kind: 'tool_error', message }, 'output')),
+        );
         recordError(span, err);
         throw err;
       } finally {
@@ -200,7 +209,11 @@ function tracedChatSend(
     (typeof capturedMessage === 'string' ? capturedMessage : safeStringify(capturedMessage)),
   );
 
-  const result = withNeatlogsSpan(span, () => original(params, ...rest));
+  const result = withNeatlogsSpan(span, () => {
+    // The SDK owns mutable chat history. A saved JSON reply cannot update it.
+    providerReplay('google_genai.models.generate_content', params, false);
+    return original(params, ...rest);
+  });
 
   return Promise.resolve(result).then(
     (response: any) => {
@@ -299,14 +312,27 @@ function tracedGenerateContent(original: (...args: any[]) => any, isStream: bool
 
     setInputAttributes(span, opts);
 
-    const result = withNeatlogsSpan(span, () => original(opts, ...rest));
+    const captureResponse = prepareProviderCapture(span, 'google_genai.models.generate_content', opts, !isStream && rest.length === 0);
+    let replayed = false;
+    let result: unknown;
+    try {
+      result = withNeatlogsSpan(span, () => {
+        const saved = providerReplay('google_genai.models.generate_content', opts, !isStream && rest.length === 0);
+        replayed = saved !== undefined;
+        return replayed ? restoreGoogleResponse(saved) : original(opts, ...rest);
+      });
+    } catch (error) {
+      recordError(span, error);
+      throw error;
+    }
 
     return Promise.resolve(result).then(
       (response: any) => {
         if (isStream) {
           return wrapStream(response, span);
         }
-        finalizeResponse(span, response);
+        if (!replayed) captureResponse(response);
+        finalizeResponse(replayed ? cachedModelSpan(span) : span, response);
         return response;
       },
       (err: any) => {

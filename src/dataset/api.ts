@@ -5,6 +5,7 @@ export type DatasetJson = null | boolean | number | string | DatasetJson[] | { [
 
 export interface DatasetApiOptions {
   token: string;
+  refreshAccessToken?: (rejectedToken: string) => Promise<string>;
   projectId: string;
   baseUrl: string;
   requestTimeoutMillis?: number;
@@ -68,9 +69,26 @@ export function serializeCaptureBody(body: unknown): string {
   return serialized;
 }
 
+async function boundedResponse(response: Response): Promise<unknown> {
+  const reader = response.body?.getReader();
+  if (!reader) throw new DatasetCaptureError('Empty dataset API response.');
+  const chunks: Uint8Array[] = []; let bytes = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytes += value.length;
+      if (bytes > 17 * 1024 * 1024) throw new DatasetCaptureError('Dataset API response exceeds 17 MiB.');
+      chunks.push(value);
+    }
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } finally { await reader.cancel(); }
+}
+
 export class DatasetApi {
   private readonly baseUrl: string;
-  private readonly token: string;
+  private token: string;
+  private readonly refreshAccessToken?: DatasetApiOptions["refreshAccessToken"];
   private readonly projectId: string;
   private readonly timeout: number;
 
@@ -79,6 +97,7 @@ export class DatasetApi {
       throw new DatasetCaptureError('An explicit dataset API token is required; ingestion API keys are not reused.');
     }
     this.token = options.token.trim();
+    this.refreshAccessToken = options.refreshAccessToken;
     this.projectId = uuid(options.projectId, 'projectId');
     let url: URL;
     try { url = new URL(options.baseUrl); }
@@ -110,10 +129,14 @@ export class DatasetApi {
       const headers = {
         Authorization: `Bearer ${this.token}`,
         'x-project-id': this.projectId,
+        ...(method === 'GET' && path.split('?')[0] === '/datasets' ? { Prefer: 'pagination=cursor' } : {}),
         ...(serialized !== undefined ? { 'Content-Type': 'application/json' } : {}),
         ...(idempotencyKey ? { 'Idempotency-Key': uuid(idempotencyKey, 'Idempotency-Key') } : {}),
       };
+      let renewed = false;
       for (let attempt = 0; ; attempt += 1) {
+        const sentToken = this.token;
+        headers.Authorization = `Bearer ${sentToken}`;
         let response: Response;
         try {
           response = await context.with(suppressTracing(context.active()), () => fetch(`${this.baseUrl}/api/v1/public${path}`, {
@@ -127,11 +150,18 @@ export class DatasetApi {
           await response.body?.cancel();
           continue;
         }
+        if (response.status === 401 && !renewed && this.refreshAccessToken) {
+          await response.body?.cancel();
+          this.token = await this.refreshAccessToken(sentToken);
+          headers.Authorization = `Bearer ${this.token}`;
+          renewed = true;
+          continue;
+        }
         if (!response.ok) {
           await response.body?.cancel();
           throw new DatasetCaptureError(`Dataset ${method} failed with HTTP ${response.status}.`, response.status);
         }
-        const envelope = record(await response.json());
+        const envelope = record(await boundedResponse(response));
         if (envelope.success !== true || !('data' in envelope)) throw new DatasetCaptureError('Invalid dataset API envelope.');
         return {
           data: envelope.data,

@@ -169,6 +169,8 @@ export interface SpanOptions {
   // Tool-specific
   /** Tool name (for kind: TOOL or MCP_TOOL). */
   toolName?: string;
+  /** Serve saved JSON tool results inside a local ReplaySession. Promise factories must declare result: 'promise'. */
+  replay?: true | { result: 'value' | 'promise' };
   /** Tool parameters schema (for kind: TOOL). */
   parameters?: Record<string, any>;
   /** JSON schema describing the tool interface (for kind: MCP_TOOL). */

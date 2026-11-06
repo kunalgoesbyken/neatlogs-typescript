@@ -74,6 +74,13 @@ function expectNoRawMedia(readable: ReadableSpan, media: any): void {
 }
 
 describe('provider tool media safety', () => {
+  it.each([new Error('service unavailable'), 'service unavailable'])('records Google tool failures without hiding thrown errors', async (failure) => {
+    const traced = traceGoogleTool('lookup', async () => { throw failure; });
+    await expect(traced({ id: 1 })).rejects.toBe(failure);
+    const readable = span();
+    expect(readable.status.code).toBe(2);
+    expect(JSON.parse(String(readable.attributes['output.value']))).toEqual({ kind: 'tool_error', message: 'service unavailable' });
+  });
   it.each([
     ['anthropic', traceAnthropicTool],
     ['bedrock', traceBedrockTool],

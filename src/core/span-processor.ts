@@ -39,6 +39,7 @@ import { verificationMarkerFromEnv } from './resource.js';
 import { setMediaCaptureAvailability } from './media.js';
 import { isHttpSpan } from './http-span.js';
 import { captureSpanStarted, captureSpanEnded } from '../dataset/capture-scope.js';
+import { stampReplaySpan } from '../replay/session.js';
 
 const logger = getLogger();
 
@@ -327,6 +328,7 @@ export class NeatlogsSpanProcessor implements SpanProcessor {
         scopeName.startsWith('neatlogs') ||
         (span.parentSpanId !== undefined && this._activeSpans.has(span.parentSpanId));
       if (sdkOwned && !isCompletionMarker) {
+        stampReplaySpan(span);
         captureSpanStarted(span, this);
         setMediaCaptureAvailability(
           span as object,

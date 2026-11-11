@@ -25,6 +25,7 @@ import {
   wrapResponsesAsyncIterableStream,
 } from "./core/openai-responses.js";
 import { recordFailure } from "./core/span-outcome.js";
+import { instrumentSdkStreamIterator } from "./core/sdk-stream.js";
 import { cachedModelSpan, prepareProviderReplay } from './replay/provider.js';
 import { prepareProviderCapture } from './replay/provider-capture.js';
 import {
@@ -401,56 +402,55 @@ function wrapAsyncIterableStream(stream: any, span: Span): any {
     return stream;
   }
 
+  const wrapIterator = (iterator: AsyncIterator<any>): AsyncIterator<any> => ({
+    async next(): Promise<IteratorResult<any>> {
+      try {
+        const result = await iterator.next();
+        if (result.done) {
+          // The SDK ends the iterator quietly on an abort; a chunk with
+          // a finish_reason means the reply did complete first.
+          accumulator.finish(
+            safeSpan,
+            cancellationRequested ||
+              (stream.controller?.signal?.aborted === true &&
+                !accumulator.hasFinishReason()),
+          );
+          return result;
+        }
+        accumulator.addChunk(span, result.value);
+        return result;
+      } catch (err) {
+        accumulator.fail(safeSpan, err);
+        throw err;
+      }
+    },
+    async return(value?: any): Promise<IteratorResult<any>> {
+      cancellationRequested = true;
+      try {
+        const result = await (iterator.return?.(value) ?? {
+          done: true,
+          value: undefined,
+        });
+        if (result.done) accumulator.finish(safeSpan, true);
+        else accumulator.addChunk(span, result.value);
+        return result;
+      } catch (err) {
+        accumulator.fail(safeSpan, err);
+        throw err;
+      }
+    },
+    async throw(err?: any): Promise<IteratorResult<any>> {
+      accumulator.fail(safeSpan, err);
+      if (iterator.throw) return iterator.throw(err);
+      throw err;
+    },
+  });
+
+  if (instrumentSdkStreamIterator(stream, wrapIterator)) return stream;
+
   return new Proxy(stream, {
     get(target, property) {
-      if (property === Symbol.asyncIterator) {
-        return () => {
-          const iterator = originalAsyncIterator();
-          return {
-            async next(): Promise<IteratorResult<any>> {
-              try {
-                const result = await iterator.next();
-                if (result.done) {
-                  // The SDK ends the iterator quietly on an abort; a chunk with
-                  // a finish_reason means the reply did complete first.
-                  accumulator.finish(
-                    safeSpan,
-                    cancellationRequested ||
-                      (stream.controller?.signal?.aborted === true &&
-                        !accumulator.hasFinishReason()),
-                  );
-                  return result;
-                }
-                accumulator.addChunk(span, result.value);
-                return result;
-              } catch (err) {
-                accumulator.fail(safeSpan, err);
-                throw err;
-              }
-            },
-            async return(value?: any): Promise<IteratorResult<any>> {
-              cancellationRequested = true;
-              try {
-                const result = await (iterator.return?.(value) ?? {
-                  done: true,
-                  value: undefined,
-                });
-                if (result.done) accumulator.finish(safeSpan, true);
-                else accumulator.addChunk(span, result.value);
-                return result;
-              } catch (err) {
-                accumulator.fail(safeSpan, err);
-                throw err;
-              }
-            },
-            async throw(err?: any): Promise<IteratorResult<any>> {
-              accumulator.fail(safeSpan, err);
-              if (iterator.throw) return iterator.throw(err);
-              throw err;
-            },
-          };
-        };
-      }
+      if (property === Symbol.asyncIterator) return () => wrapIterator(originalAsyncIterator());
       const value = Reflect.get(target, property, target);
       return typeof value === "function" ? value.bind(target) : value;
     },

@@ -11,6 +11,7 @@ import {
   utf8ByteLength,
 } from "../constants.js";
 import { captureMedia } from "./media.js";
+import { instrumentSdkStreamIterator } from "./sdk-stream.js";
 import {
   markCancelled,
   recordFailure,
@@ -129,50 +130,51 @@ export function wrapResponsesAsyncIterableStream(stream: any, span: Span): any {
     }
   };
 
+  const wrapIterator = (iterator: AsyncIterator<any>): AsyncIterator<any> => ({
+    async next(): Promise<IteratorResult<any>> {
+      try {
+        const result = await iterator.next();
+        if (result.done) {
+          finalize(cancellationRequested || abortedBySdk());
+          return result;
+        }
+        addEvent(result.value);
+        return result;
+      } catch (err) {
+        fail(err);
+        throw err;
+      }
+    },
+    async return(value?: any): Promise<IteratorResult<any>> {
+      cancellationRequested = true;
+      try {
+        const result = await (iterator.return?.(value) ?? {
+          done: true,
+          value,
+        });
+        if (result.done) finalize(true);
+        else addEvent(result.value);
+        return result;
+      } catch (err) {
+        fail(err);
+        throw err;
+      }
+    },
+    async throw(err?: any): Promise<IteratorResult<any>> {
+      fail(err);
+      if (iterator.throw) return iterator.throw(err);
+      throw err;
+    },
+  });
+
+  if (instrumentSdkStreamIterator(stream, wrapIterator)) return stream;
+
   // A proxy preserves the OpenAI stream's public surface. Binding methods back
   // to the original object also avoids breaking SDK classes with private fields.
   return new Proxy(stream, {
     get(target, prop) {
       if (prop === Symbol.asyncIterator) {
-        return () => {
-          const iterator = originalAsyncIterator();
-          return {
-            async next(): Promise<IteratorResult<any>> {
-              try {
-                const result = await iterator.next();
-                if (result.done) {
-                  finalize(cancellationRequested || abortedBySdk());
-                  return result;
-                }
-                addEvent(result.value);
-                return result;
-              } catch (err) {
-                fail(err);
-                throw err;
-              }
-            },
-            async return(value?: any): Promise<IteratorResult<any>> {
-              cancellationRequested = true;
-              try {
-                const result = await (iterator.return?.(value) ?? {
-                  done: true,
-                  value,
-                });
-                if (result.done) finalize(true);
-                else addEvent(result.value);
-                return result;
-              } catch (err) {
-                fail(err);
-                throw err;
-              }
-            },
-            async throw(err?: any): Promise<IteratorResult<any>> {
-              fail(err);
-              if (iterator.throw) return iterator.throw(err);
-              throw err;
-            },
-          };
-        };
+        return () => wrapIterator(originalAsyncIterator());
       }
 
       const value = Reflect.get(target, prop, target);

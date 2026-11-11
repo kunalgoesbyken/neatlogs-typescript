@@ -26,6 +26,7 @@ import {
   wrapResponsesAsyncIterableStream,
 } from './core/openai-responses.js';
 import { recordFailure } from './core/span-outcome.js';
+import { instrumentSdkStreamIterator } from './core/sdk-stream.js';
 import {
   getNeatlogsTracer,
   getNeatlogsParentContext,
@@ -258,11 +259,7 @@ function wrapAsyncIterableStream(stream: any, span: Span): any {
     return stream;
   }
 
-  const wrapped = Object.create(Object.getPrototypeOf(stream));
-  Object.assign(wrapped, stream);
-
-  wrapped[Symbol.asyncIterator] = function () {
-    const iterator = originalAsyncIterator();
+  const wrapIterator = (iterator: AsyncIterator<any>): AsyncIterator<any> => {
     return {
       async next(): Promise<IteratorResult<any>> {
         try {
@@ -304,6 +301,12 @@ function wrapAsyncIterableStream(stream: any, span: Span): any {
       },
     };
   };
+
+  if (instrumentSdkStreamIterator(stream, wrapIterator)) return stream;
+
+  const wrapped = Object.create(Object.getPrototypeOf(stream));
+  Object.assign(wrapped, stream);
+  wrapped[Symbol.asyncIterator] = () => wrapIterator(originalAsyncIterator());
 
   return wrapped;
 }

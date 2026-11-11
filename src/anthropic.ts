@@ -24,6 +24,7 @@ import { getProviderTracer } from './core/auto-root.js';
 import { observeRawResponse } from './core/raw-response.js';
 import { captureMedia, captureMediaWithIndex } from './core/media.js';
 import { markCancelled, recordFailure } from './core/span-outcome.js';
+import { instrumentSdkStreamIterator } from './core/sdk-stream.js';
 import {
   getNeatlogsTracer,
   getNeatlogsParentContext,
@@ -261,11 +262,7 @@ function wrapStreamIterable(stream: any, span: Span): any {
   const abortedBySdk = () =>
     !accumulated.stopReason && stream.controller?.signal?.aborted === true;
 
-  const wrapped = Object.create(Object.getPrototypeOf(stream));
-  Object.assign(wrapped, stream);
-
-  wrapped[Symbol.asyncIterator] = function () {
-    const iterator = originalAsyncIterator();
+  const wrapIterator = (iterator: AsyncIterator<any>): AsyncIterator<any> => {
     return {
       async next(): Promise<IteratorResult<any>> {
         try {
@@ -301,6 +298,12 @@ function wrapStreamIterable(stream: any, span: Span): any {
       },
     };
   };
+
+  if (instrumentSdkStreamIterator(stream, wrapIterator)) return stream;
+
+  const wrapped = Object.create(Object.getPrototypeOf(stream));
+  Object.assign(wrapped, stream);
+  wrapped[Symbol.asyncIterator] = () => wrapIterator(originalAsyncIterator());
 
   if (typeof stream.finalMessage === 'function') {
     const origFinal = stream.finalMessage.bind(stream);
